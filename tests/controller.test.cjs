@@ -9,17 +9,26 @@ const bundle = fs.readFileSync(process.env.CONCEPT_ROAMER_TEST_BUNDLE ??
   path.join(__dirname, '../dist/concept-roamer/main.js'), 'utf8');
 
 class TFile {
-  constructor(path) { this.path = path; this.name = path.split('/').at(-1); this.extension = this.name.split('.').at(-1); }
+  constructor(path) {
+    this.path = path; this.name = path.split('/').at(-1); this.extension = this.name.split('.').at(-1);
+    this.basename = this.name.slice(0, -this.extension.length - 1);
+  }
 }
 class TFolder { constructor(path) { this.path = path; } }
 class BasePlugin {
-  constructor(app) { this.app = app; }
+  constructor(app) { this.app = app; this.commands = new Map(); this.registeredEvents = []; this.cleanups = []; }
   async loadData() { return null; }
   async saveData() {}
   registerView() {}
   addSettingTab() {}
   addRibbonIcon() {}
-  addCommand() {}
+  addCommand(command) { this.commands.set(command.id, command); }
+  registerEvent(event) { this.registeredEvents.push(event); }
+  register(callback) { this.cleanups.push(callback); }
+  registerDomEvent(element, name, callback, options) {
+    element.addEventListener(name, callback, options);
+    this.register(() => element.removeEventListener(name, callback, options));
+  }
 }
 class Empty {}
 
@@ -32,17 +41,51 @@ function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-te
   const nativeRequests = [];
   const createAttempts = [];
   const layoutCallbacks = [];
+  const workspaceEvents = new Map();
+  const shownMenus = [];
+  const leaves = [];
+  const leafOperations = [];
+  const reads = [];
   let layoutReady = layoutInitiallyReady;
   let failAssistantSave = false;
+  let failUserSave = false;
+  let activeNoteView = null;
+  const makeLeaf = kind => {
+    const leaf = {
+      kind, states: [], view: { focusComposer: () => leafOperations.push({ action: 'focus', leaf }) },
+      setViewState: async state => { leaf.states.push(state); leaf.viewType = state.type; },
+    };
+    leaves.push(leaf);
+    leafOperations.push({ action: 'create', kind, leaf });
+    return leaf;
+  };
   const obsidian = {
     Plugin: BasePlugin, ItemView: Empty, PluginSettingTab: Empty, SuggestModal: Empty,
     Component: Empty, Modal: Empty, SecretComponent: Empty, Setting: Empty, Notice: Empty,
+    MarkdownView: Empty,
+    Menu: { forEvent: () => {
+      const menu = selectionMenu();
+      menu.showAtMouseEvent = event => shownMenus.push({ menu, event });
+      return menu;
+    } },
     TFile, TFolder, normalizePath: path => path,
     Platform: platform,
   };
   const app = {
     workspace: {
       onLayoutReady: callback => layoutReady ? callback() : layoutCallbacks.push(callback),
+      on: (name, callback) => {
+        const handlers = workspaceEvents.get(name) ?? [];
+        handlers.push(callback); workspaceEvents.set(name, handlers);
+        return { name, callback };
+      },
+      iterateAllLeaves: callback => leaves.forEach(callback),
+      getLeavesOfType: type => leaves.filter(leaf => leaf.viewType === type),
+      openPopoutLeaf: () => makeLeaf('popout'),
+      getLeaf: kind => makeLeaf(kind),
+      getRightLeaf: () => makeLeaf('right'),
+      revealLeaf: async leaf => { leafOperations.push({ action: 'reveal', leaf }); },
+      getActiveViewOfType: () => activeNoteView,
     },
     secretStorage: { getSecret: () => apiKey },
     saveLocalStorage: (key, value) => value === null ? storage.delete(key) : storage.set(key, JSON.parse(JSON.stringify(value))),
@@ -58,6 +101,7 @@ function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-te
           return file ? { type: file instanceof TFolder ? 'folder' : 'file' } : null;
         },
         read: async path => {
+          reads.push(path);
           const record = records.get(path);
           if (!record || !(record.file instanceof TFile)) throw new Error('File not found');
           return record.text;
@@ -79,11 +123,12 @@ function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-te
         records.set(path, { file: new TFolder(path) });
       },
       create: async (path, text) => {
+        if (path.endsWith('.json') && JSON.parse(text).role === 'user' && failUserSave) throw new Error('user disk write failed');
         if (path.endsWith('.json') && JSON.parse(text).role === 'assistant' && failAssistantSave) throw new Error('disk write failed');
         if (records.has(path)) throw new Error('already exists');
         const file = new TFile(path); records.set(path, { file, text }); return file;
       },
-      read: async file => records.get(file.path).text,
+      read: async file => { reads.push(file.path); return records.get(file.path).text; },
     },
   };
   const respond = options => responder ? responder(options) : new Response(
@@ -113,7 +158,9 @@ function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-te
     return request;
   };
   const module = { exports: {} };
-  vm.runInNewContext(bundle, {
+  // Expose the bundled formatter only inside this test VM so the complete
+  // organizer flow can verify generated links without hand-building Markdown.
+  vm.runInNewContext(`${bundle}\nmodule.exports.__testConceptBody = conceptBody;`, {
     module, exports: module.exports,
     require: name => {
       moduleLoads.push(name);
@@ -134,7 +181,21 @@ function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-te
   plugin.loadData = async () => ({ automaticTitles, transport });
   return {
     plugin, app, records, storage, calls, fetchCalls, moduleLoads, nativeRequests, createAttempts,
+    leaves, leafOperations, reads, shownMenus, conceptBody: module.exports.__testConceptBody,
+    emitWorkspace: (name, ...args) => (workspaceEvents.get(name) ?? []).forEach(callback => callback(...args)),
+    setActiveNoteView: view => { activeNoteView = view; app.workspace.activeEditor = view; },
+    addReadingLeaf: (doc, filePath, nodes) => {
+      const view = new Empty();
+      view.file = new TFile(filePath);
+      view.getMode = () => 'preview';
+      view.contentEl = { ownerDocument: doc };
+      view.previewMode = { containerEl: { ownerDocument: doc, contains: node => nodes.includes(node) } };
+      const leaf = { view, viewType: 'markdown' };
+      leaves.push(leaf);
+      return view;
+    },
     failSave: value => { failAssistantSave = value; },
+    failUserSave: value => { failUserSave = value; },
     finishLayout: () => { layoutReady = true; layoutCallbacks.splice(0).forEach(callback => callback()); },
   };
 }
@@ -145,6 +206,350 @@ async function ready(options) {
   await host.plugin.ready;
   return host;
 }
+
+function selectionMenu() {
+  const items = [];
+  return {
+    items,
+    addItem: configure => {
+      const item = {
+        setTitle(value) { this.title = value; return this; },
+        setIcon(value) { this.icon = value; return this; },
+        onClick(callback) { this.callback = callback; return this; },
+      };
+      configure(item); items.push(item);
+    },
+  };
+}
+
+const selectedPassage = { path: '阅读/路径依赖.md', title: '路径依赖', text: '早期的选择会改变后续选择的成本。' };
+const plain = value => JSON.parse(JSON.stringify(value));
+
+test('selection discussion: editor menu appears only for text and captures the original note and passage', async () => {
+  const host = await ready();
+  let selection = '   \n';
+  const editor = { getSelection: () => selection };
+  const info = { file: new TFile(selectedPassage.path) };
+  const empty = selectionMenu();
+  host.emitWorkspace('editor-menu', empty, editor, info);
+  assert.equal(empty.items.length, 0);
+
+  selection = selectedPassage.text;
+  const menu = selectionMenu();
+  host.emitWorkspace('editor-menu', menu, editor, info);
+  const discuss = menu.items.find(item => item.title === '在漫游中讨论');
+  assert.ok(discuss, 'selection context menu should offer a discussion action');
+  selection = '随后在其他笔记中选择的文字';
+  info.file = new TFile('别的笔记.md');
+  discuss.callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(plain(host.plugin.selectedQuote), selectedPassage);
+  assert.equal(host.calls.length, 0, 'opening discussion must not send text to the model');
+  assert.equal(host.plugin.session, null);
+});
+
+test('selection discussion: reuses the existing chat window and otherwise opens a desktop popout or mobile tab', async () => {
+  const desktop = { isDesktop: true, isDesktopApp: true, isMobileApp: false };
+  for (const [platform, expectedKind] of [[desktop, 'popout'], [undefined, 'tab']]) {
+    const host = await ready({ platform });
+    await host.plugin.prepareNoteDiscussion(selectedPassage);
+    assert.equal(host.leaves.length, 1);
+    assert.equal(host.leaves[0].kind, expectedKind);
+    assert.equal(host.leaves[0].viewType, 'concept-roamer-chat');
+    const original = host.leaves[0];
+    await host.plugin.prepareNoteDiscussion({ ...selectedPassage, text: '新的选段' });
+    assert.equal(host.leaves.length, 1, 'each selection should not create another chat window');
+    assert.equal(host.leafOperations.filter(operation => operation.action === 'reveal').at(-1).leaf, original);
+    assert.equal(host.calls.length, 0);
+    assert.equal(host.plugin.messages.length, 0);
+    assert.equal(host.plugin.selectedQuote.text, '新的选段');
+  }
+});
+
+test('selection discussion: concurrent selections open one desktop window and retain the newest passage', async () => {
+  const host = await ready({ platform: { isDesktop: true, isDesktopApp: true, isMobileApp: false } });
+  const latest = { path: '阅读/新的选择.md', title: '新的选择', text: '这是第二次选中的段落。' };
+  await Promise.all([
+    host.plugin.prepareNoteDiscussion(selectedPassage),
+    host.plugin.prepareNoteDiscussion(latest),
+  ]);
+  assert.equal(host.leaves.length, 1);
+  assert.equal(host.leaves[0].kind, 'popout');
+  assert.deepEqual(plain(host.plugin.selectedQuote), latest);
+  assert.equal(host.calls.length, 0);
+});
+
+test('selection discussion: the command supports the current editor selection without sending a model request', async () => {
+  const host = await ready();
+  const command = host.plugin.commands.get('discuss-selection');
+  assert.ok(command);
+  assert.equal(command.checkCallback(true), false);
+  let selection = selectedPassage.text;
+  host.setActiveNoteView({ getMode: () => 'source', file: new TFile(selectedPassage.path), editor: { getSelection: () => selection } });
+  assert.equal(command.checkCallback(true), true);
+  assert.equal(host.plugin.selectedQuote, null, 'checking command availability must have no side effects');
+  assert.equal(command.checkCallback(false), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(plain(host.plugin.selectedQuote), selectedPassage);
+  assert.equal(host.calls.length, 0);
+  selection = '';
+  assert.equal(command.checkCallback(true), false);
+});
+
+test('selection discussion: persists source attribution separately and restores the excerpt in follow-up context', async () => {
+  const host = await ready();
+  host.records.set(selectedPassage.path, { file: new TFile(selectedPassage.path),
+    text: `${selectedPassage.text}\n全篇未选中文本-不应发送-测试标记` });
+  await host.plugin.prepareNoteDiscussion(selectedPassage);
+  const quote = host.plugin.selectedQuote;
+  assert.equal(await host.plugin.send('这是什么意思？', quote), true);
+  assert.equal(host.plugin.selectedQuote, null);
+  const user = host.plugin.messages[0];
+  assert.equal(user.content, '这是什么意思？');
+  assert.deepEqual(plain(user.noteQuote), selectedPassage);
+  assert.equal(host.calls[0].messages.at(-1).role, 'user');
+  const input = host.calls[0].messages.at(-1).content;
+  assert.match(input, /这是什么意思/);
+  assert.ok(input.includes(selectedPassage.text));
+  assert.ok(input.includes(selectedPassage.path));
+  assert.ok(input.includes(selectedPassage.title));
+  assert.equal(JSON.stringify(host.calls).includes('全篇未选中文本-不应发送-测试标记'), false);
+  assert.equal(host.reads.includes(selectedPassage.path), false, 'quoted discussion should not read the full source note');
+  const saved = [...host.records.values()].find(record => {
+    if (!record.file.path.endsWith('.json')) return false;
+    return JSON.parse(record.text).id === user.id;
+  });
+  assert.deepEqual(JSON.parse(saved.text).noteQuote, selectedPassage);
+  host.plugin.onunload();
+  const restored = await ready({ records: host.records, storage: host.storage });
+  assert.equal(restored.plugin.messages[0].content, '这是什么意思？');
+  assert.deepEqual(plain(restored.plugin.messages[0].noteQuote), selectedPassage);
+  await restored.plugin.send('举一个生活中的例子');
+  assert.equal(restored.calls[0].messages[1].content, input);
+  assert.equal(restored.calls[0].messages.at(-1).content, '举一个生活中的例子');
+  assert.equal(JSON.stringify(restored.calls).includes('全篇未选中文本-不应发送-测试标记'), false);
+});
+
+test('selection discussion: an explicitly created session retains a source-aware provisional title after reload', async () => {
+  const host = await ready();
+  await host.plugin.newSession();
+  await host.plugin.prepareNoteDiscussion(selectedPassage);
+  assert.equal(await host.plugin.send('', host.plugin.selectedQuote), true);
+  const title = host.plugin.session.title;
+  assert.ok(title.includes(selectedPassage.title));
+  assert.match(title, /理解/);
+  assert.notEqual(title, '新的探索');
+  assert.equal(host.plugin.messages[0].content, '请帮我理解这段文字，并指出值得进一步讨论的问题。');
+  const originalMetadata = [...host.records].find(([name]) => name.endsWith('/会话.json'))[1].text;
+  assert.equal(JSON.parse(originalMetadata).title, '新的探索', 'initial session metadata remains immutable');
+  host.plugin.onunload();
+  const restored = await ready({ records: host.records, storage: host.storage });
+  assert.equal(restored.plugin.session.title, title);
+  assert.equal(restored.calls.length, 0);
+});
+
+test('selection discussion: concept organization uses only the selected source excerpt and generates a valid note link', async () => {
+  const passage = { ...selectedPassage, text: selectedPassage.text.repeat(50) };
+  const sentinel = '源笔记未选中的正文-不应读取或发送-测试标记';
+  let organizationInput;
+  const host = await ready({ responder: options => {
+    const payload = JSON.parse(options.body);
+    if (!payload.response_format) return streamedText('这段材料讨论了早期选择如何影响后续决策。');
+    organizationInput = JSON.parse(payload.messages[1].content);
+    return streamedText(JSON.stringify({
+      title: '路径依赖', definition: '早期选择会影响后续选择空间。', mechanism: '既有投入与切换成本。',
+      examples: ['长期使用某种工作流程。'], boundaries: ['规则变化可能打破旧路径。'], applications: ['理解转变成本。'],
+      userStatements: [], openQuestions: ['如何降低转变成本？'],
+      related: [{ path: passage.path, reason: '原始选段展示了选择成本如何延续。' }], sources: [],
+      summary: '从选中的笔记原文讨论了路径依赖的含义及边界。',
+    }));
+  } });
+  const originalSource = `${passage.text}\n\n${sentinel}`;
+  host.records.set(passage.path, { file: new TFile(passage.path), text: originalSource });
+  await host.plugin.prepareNoteDiscussion(passage);
+  await host.plugin.send('请解释这段材料', host.plugin.selectedQuote);
+  const draft = await host.plugin.generateConcept();
+  assert.equal(host.calls.length, 2);
+  assert.deepEqual(plain(draft.input.relatedNotes[0]), {
+    path: passage.path, title: passage.title, excerpt: passage.text.slice(0, 900),
+  });
+  assert.deepEqual(organizationInput.relatedNotes[0], plain(draft.input.relatedNotes[0]));
+  assert.equal(organizationInput.messages[0].content, '请解释这段材料');
+  assert.deepEqual(organizationInput.messages[0].noteQuote, passage);
+  assert.equal(host.reads.includes(passage.path), false);
+  assert.equal(JSON.stringify(host.calls).includes(sentinel), false);
+  const body = host.conceptBody(draft);
+  assert.ok(body.includes('[[阅读/路径依赖|路径依赖]]：原始选段展示了选择成本如何延续。'));
+  const savedPath = await host.plugin.saveConcept(draft, '路径依赖', body);
+  assert.ok(host.records.get(savedPath).text.includes('[[阅读/路径依赖|路径依赖]]'));
+  assert.equal(host.records.get(passage.path).text, originalSource);
+  assert.equal(host.reads.includes(passage.path), false);
+});
+
+test('selection discussion: after acceptance a network failure preserves the saved quote and clears only its composer attachment', async () => {
+  const host = await ready({ responder: () => { throw new TypeError('Failed to fetch'); } });
+  await host.plugin.prepareNoteDiscussion(selectedPassage);
+  assert.equal(await host.plugin.send('解释这段话', host.plugin.selectedQuote), true);
+  assert.equal(host.plugin.selectedQuote, null);
+  assert.equal(host.plugin.messages[0].content, '解释这段话');
+  assert.deepEqual(plain(host.plugin.messages[0].noteQuote), selectedPassage);
+  assert.equal(host.plugin.messages[1].status, 'error');
+  assert.equal(host.calls.length, 1);
+  const restored = await ready({ records: host.records, storage: host.storage });
+  assert.deepEqual(plain(restored.plugin.messages[0].noteQuote), selectedPassage);
+});
+
+test('selection discussion: missing key, busy state or user-save failure retains the selected passage before acceptance', async () => {
+  for (const failure of ['missing-key', 'busy', 'save']) {
+    const host = await ready({ apiKey: failure === 'missing-key' ? null : 'local-test-key' });
+    await host.plugin.prepareNoteDiscussion(selectedPassage);
+    const quote = host.plugin.selectedQuote;
+    if (failure === 'busy') {
+      host.plugin.state = 'connecting';
+      assert.equal(await host.plugin.send('解释这段话', quote), false);
+      host.plugin.state = 'idle';
+    } else {
+      if (failure === 'save') host.failUserSave(true);
+      await assert.rejects(host.plugin.send('解释这段话', quote), failure === 'save' ? /user disk write failed/ : /API Key/);
+    }
+    assert.equal(host.plugin.selectedQuote, quote);
+    assert.equal(host.calls.length, 0);
+    assert.equal(host.plugin.messages.length, 0);
+    host.plugin.onunload();
+  }
+});
+
+test('selection discussion: accepting an older attachment does not clear a newer selection', async () => {
+  const host = await ready();
+  await host.plugin.prepareNoteDiscussion(selectedPassage);
+  const originalQuote = host.plugin.selectedQuote;
+  let reachedUserSave;
+  let releaseUserSave;
+  const reached = new Promise(resolve => { reachedUserSave = resolve; });
+  const blocked = new Promise(resolve => { releaseUserSave = resolve; });
+  const originalCreate = host.app.vault.create;
+  host.app.vault.create = async (name, text) => {
+    if (name.endsWith('.json') && JSON.parse(text).role === 'user') { reachedUserSave(); await blocked; }
+    return originalCreate(name, text);
+  };
+  const sending = host.plugin.send('解释旧的选段', originalQuote);
+  await reached;
+  await host.plugin.prepareNoteDiscussion({ path: '阅读/新概念.md', title: '新概念', text: '这是后来选中的文字。' });
+  const newerQuote = host.plugin.selectedQuote;
+  host.plugin.clearSelectedQuote(originalQuote);
+  assert.equal(host.plugin.selectedQuote, newerQuote);
+  releaseUserSave();
+  assert.equal(await sending, true);
+  assert.equal(host.plugin.selectedQuote, newerQuote);
+  assert.deepEqual(plain(host.plugin.messages[0].noteQuote), selectedPassage);
+  assert.equal(host.calls[0].messages.at(-1).content.includes(newerQuote.text), false);
+  host.plugin.clearSelectedQuote(newerQuote);
+  assert.equal(host.plugin.selectedQuote, null);
+});
+
+test('selection discussion: excerpt and encoded combined-input limits reject before any message is accepted', async () => {
+  const host = await ready();
+  await host.plugin.prepareNoteDiscussion(selectedPassage);
+  const staged = host.plugin.selectedQuote;
+  await assert.rejects(host.plugin.send('解释', { ...selectedPassage, text: '段'.repeat(8_001) }));
+  await assert.rejects(host.plugin.send('问'.repeat(12_000), { ...selectedPassage, text: '段'.repeat(8_000) }));
+  assert.equal(host.plugin.selectedQuote, staged);
+  assert.equal(host.calls.length, 0);
+  assert.equal(host.plugin.session, null);
+  assert.equal(host.plugin.messages.length, 0);
+});
+
+test('selection discussion: reading menu captures a passage in its own window and leaves unrelated menus alone', async () => {
+  const host = await ready();
+  const listeners = new Map();
+  let currentText = selectedPassage.text;
+  const start = {}, end = {}, outside = {};
+  let range = { startContainer: start, endContainer: end };
+  const selection = { isCollapsed: false, rangeCount: 1, toString: () => currentText, getRangeAt: () => range };
+  const doc = {
+    defaultView: { getSelection: () => selection, navigator: {} },
+    addEventListener: (name, callback) => {
+      const handlers = listeners.get(name) ?? []; handlers.push(callback); listeners.set(name, handlers);
+    },
+    removeEventListener: (name, callback) => listeners.set(name, (listeners.get(name) ?? []).filter(handler => handler !== callback)),
+  };
+  const view = host.addReadingLeaf(doc, selectedPassage.path, [start, end]);
+  host.emitWorkspace('window-open', {}, { document: doc });
+  host.emitWorkspace('window-open', {}, { document: doc });
+  assert.equal(listeners.get('contextmenu').length, 1, 'each document should have one context menu listener');
+  let prevented = 0;
+  let stopped = 0;
+  const trigger = target => listeners.get('contextmenu')[0]({
+    target, preventDefault: () => prevented++, stopPropagation: () => stopped++,
+  });
+  trigger(outside);
+  assert.equal(prevented, 0);
+  assert.equal(host.shownMenus.length, 0);
+  range = { startContainer: start, endContainer: outside };
+  trigger(start);
+  assert.equal(prevented, 0, 'a range extending outside the note must not become a note quote');
+  range = { startContainer: start, endContainer: end };
+  trigger(start);
+  assert.equal(prevented, 1);
+  assert.equal(stopped, 1);
+  assert.equal(host.shownMenus.length, 1);
+  const discuss = host.shownMenus[0].menu.items.find(item => item.title === '在漫游中讨论');
+  assert.ok(discuss);
+  currentText = '打开菜单后选择变化';
+  view.file = new TFile('阅读/另一篇笔记.md');
+  discuss.callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(plain(host.plugin.selectedQuote), selectedPassage);
+  assert.equal(host.calls.length, 0);
+});
+
+test('selection discussion: reading command validates selection boundaries across notes and window documents', async () => {
+  const host = await ready();
+  const aStart = {}, aEnd = {}, bStart = {};
+  let range = { startContainer: aStart, endContainer: aEnd };
+  let collapsed = false;
+  const docA = { defaultView: { getSelection: () => ({
+    isCollapsed: collapsed, rangeCount: 1, toString: () => selectedPassage.text, getRangeAt: () => range,
+  }) } };
+  const docB = { defaultView: { getSelection: () => null } };
+  const viewA = host.addReadingLeaf(docA, selectedPassage.path, [aStart, aEnd]);
+  const viewB = host.addReadingLeaf(docB, '阅读/其他窗口.md', [bStart]);
+  host.setActiveNoteView(viewA);
+  const command = host.plugin.commands.get('discuss-selection');
+  assert.equal(command.checkCallback(true), true);
+  range = { startContainer: aStart, endContainer: bStart };
+  assert.equal(command.checkCallback(true), false);
+  range = { startContainer: aStart, endContainer: aEnd };
+  host.setActiveNoteView(viewB);
+  assert.equal(command.checkCallback(true), false, 'selection from another window is not the active note selection');
+  host.setActiveNoteView(viewA);
+  collapsed = true;
+  assert.equal(command.checkCallback(true), false);
+  collapsed = false;
+  assert.equal(command.checkCallback(false), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(plain(host.plugin.selectedQuote), selectedPassage);
+  assert.equal(host.calls.length, 0);
+});
+
+test('selection discussion: malformed persisted attribution is rejected without rewriting chat data', async () => {
+  const original = await ready();
+  await original.plugin.send('普通聊天');
+  const user = original.plugin.messages[0];
+  const userRecord = [...original.records.values()].find(record => record.file.path.endsWith(`/${user.id}.json`));
+  const saved = JSON.parse(userRecord.text);
+  saved.noteQuote = { text: '格式错误的同步引用', path: 'https://example.com/remote.md', title: '外部页面' };
+  userRecord.text = JSON.stringify(saved);
+  const before = userRecord.text;
+  original.plugin.onunload();
+  const restored = fakeHost({ records: original.records, storage: original.storage });
+  await restored.plugin.onload();
+  await assert.rejects(restored.plugin.ready, /笔记引用/);
+  assert.equal(userRecord.text, before);
+  assert.equal(restored.calls.length, 0);
+  assert.equal(restored.plugin.messages.length, 0);
+  restored.plugin.onunload();
+});
 
 test('controller: sends real streaming payload; reload recovers history and excludes credentials from saved data', async () => {
   const host = await ready();

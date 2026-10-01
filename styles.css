@@ -30,6 +30,13 @@
 .concept-roamer .cr-footer { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
 .concept-roamer .cr-status { font-size: .78em; color: var(--text-muted); min-height: 1.5em; overflow-wrap: anywhere; }
 .concept-roamer .cr-input { width: 100%; resize: vertical; min-height: 80px; max-height: 240px; padding: 12px; border-radius: 10px; line-height: 1.5; }
+.concept-roamer .cr-note-quote { min-width: 0; border-left: 3px solid var(--interactive-accent); border-radius: 6px; padding: 8px 10px; background: var(--background-secondary); margin-top: 8px; }
+.concept-roamer .cr-pending-quote { margin-top: 0; }
+.concept-roamer .cr-note-quote-header { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.concept-roamer .cr-note-quote-label { flex-shrink: 0; font-size: .72em; color: var(--text-muted); }
+.concept-roamer .cr-note-source { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-accent); background: transparent; border: none; box-shadow: none; padding: 0; text-align: left; }
+.concept-roamer .cr-note-remove { margin-left: auto; flex-shrink: 0; }
+.concept-roamer .cr-note-quote-body { max-height: 100px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85em; line-height: 1.6; margin-top: 5px; user-select: text; }
 .concept-roamer .cr-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 7px; }
 .concept-roamer .cr-hint { font-size: .7em; color: var(--text-faint); margin-right: auto; }
 @media (max-width: 450px) {

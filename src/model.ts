@@ -1,4 +1,7 @@
+import { messageText } from './selection';
+
 export type MessageStatus = 'complete' | 'streaming' | 'stopped' | 'interrupted' | 'truncated' | 'error';
+export interface NoteQuote { path: string; title: string; text: string }
 export interface Message {
   schemaVersion: 1;
   id: string;
@@ -11,6 +14,7 @@ export interface Message {
   model?: string;
   usage?: Record<string, unknown>;
   error?: string;
+  noteQuote?: NoteQuote;
 }
 export interface Session {
   schemaVersion: 1;
@@ -56,5 +60,5 @@ export function leafMessages(all: Message[]): Message[] {
 
 export function contextMessages(chain: Message[]): { role: 'user' | 'assistant'; content: string }[] {
   return chain.filter(message => message.role === 'user' || message.status === 'complete')
-    .map(message => ({ role: message.role, content: message.content }));
+    .map(message => ({ role: message.role, content: messageText(message) }));
 }

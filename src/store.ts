@@ -2,6 +2,7 @@ import { App, normalizePath, TFile, TFolder } from 'obsidian';
 import { Message, Session, newId } from './model';
 import { safeNoteTitle } from './organize';
 import { TitleRevision, applyTitleRevisions, conversationTitle, provisionalTitle } from './titles';
+import { noteQuote } from './selection';
 
 export const ROOT = '概念漫游';
 export const PERSONA = `${ROOT}/人格.md`;
@@ -62,7 +63,7 @@ export class VaultStore {
       try {
         const messages = await this.messages(session.id);
         const first = messages.filter(message => message.role === 'user').sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
-        if (first) session = { ...session, title: provisionalTitle(first.content) };
+        if (first) session = { ...session, title: provisionalTitle(first.noteQuote ? `${first.noteQuote.title}：${first.content}` : first.content) };
       } catch { /* Keep the placeholder until the message files finish syncing. */ }
     }
     const folder = `${ROOT}/会话/${session.id}/标题`;
@@ -166,6 +167,12 @@ export class VaultStore {
           (entry.role !== 'user' && entry.role !== 'assistant') ||
           typeof entry.createdAt !== 'string' || path !== `${prefix}${entry.id}.json`) {
         throw new Error('发现无效的会话记录，已停止加载。');
+      }
+      if (entry.noteQuote !== undefined) {
+        try {
+          if (entry.role !== 'user') throw new Error('引用只能附在用户消息上。');
+          entry.noteQuote = noteQuote(entry.noteQuote.text, entry.noteQuote.path, entry.noteQuote.title);
+        } catch { throw new Error('消息中的笔记引用尚未同步完整或格式不正确，请稍后重试。'); }
       }
       messages.push(entry);
     }

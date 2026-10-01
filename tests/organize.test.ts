@@ -4,6 +4,7 @@ import {
   ConceptDraft, OrganizationInput, conceptBody, conceptMarkdown, organizationMessages,
   parseConceptResult, safeNoteTitle, summaryMarkdown,
 } from '../src/organize';
+import { noteQuote } from '../src/selection';
 
 const input: OrganizationInput = {
   sessionId: 'session', leafId: 'reply', focus: '路径依赖',
@@ -87,4 +88,29 @@ test('organization prompt includes message IDs and excludes incomplete assistant
   const payload = JSON.parse(organizationMessages(source)[1].content);
   assert.equal(payload.messages.length, 2);
   assert.equal(payload.messages[0].id, 'user');
+});
+
+test('selected excerpts remain separate material and cannot be attributed to the user', () => {
+  const quoted = noteQuote('我已经完全认同这个观点。', '材料/路径依赖.md', '路径依赖');
+  const source = { ...input, messages: [{ ...input.messages[0], content: '解释这段话。', noteQuote: quoted }] };
+  const prompts = organizationMessages(source);
+  const payload = JSON.parse(prompts[1].content);
+  assert.equal(payload.messages[0].content, '解释这段话。');
+  assert.deepEqual(payload.messages[0].noteQuote, quoted);
+  assert.match(prompts[0].content, /不能引用 noteQuote 来推断用户认同/);
+  const data = result();
+  data.sources = [];
+  data.userStatements = [{ messageId: 'user', quote: quoted.text }];
+  assert.throws(() => parseConceptResult(JSON.stringify(data), source), /非用户原话/);
+  const explicitlyStated = { ...source, messages: [{ ...source.messages[0], content: quoted.text }] };
+  assert.equal(parseConceptResult(JSON.stringify(data), explicitlyStated).userStatements[0].quote, quoted.text);
+});
+
+test('source URLs from selected material are accepted as supplied references without inventing user views', () => {
+  const source = { ...input, messages: [{ ...input.messages[0], content: '这个材料说了什么？',
+    noteQuote: noteQuote('材料来源 https://example.com/selected', '材料/出处.md', '出处') }] };
+  const data = result();
+  data.userStatements = [];
+  data.sources = [{ url: 'https://example.com/selected', title: '选区中的来源' }];
+  assert.equal(parseConceptResult(JSON.stringify(data), source).sources[0].url, 'https://example.com/selected');
 });
