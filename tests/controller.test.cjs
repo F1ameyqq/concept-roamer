@@ -245,7 +245,8 @@ test('selection discussion: editor menu appears only for text and captures the o
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(plain(host.plugin.selectedQuote), selectedPassage);
   assert.equal(host.calls.length, 0, 'opening discussion must not send text to the model');
-  assert.equal(host.plugin.session, null);
+  assert.ok(host.plugin.session, 'default discussion creates a durable empty conversation');
+  assert.equal(host.plugin.messages.length, 0);
 });
 
 test('selection discussion: reuses the existing chat window and otherwise opens a desktop popout or mobile tab', async () => {
@@ -257,12 +258,14 @@ test('selection discussion: reuses the existing chat window and otherwise opens 
     assert.equal(host.leaves[0].kind, expectedKind);
     assert.equal(host.leaves[0].viewType, 'concept-roamer-chat');
     const original = host.leaves[0];
+    const originalSessionId = host.plugin.session.id;
     await host.plugin.prepareNoteDiscussion({ ...selectedPassage, text: '新的选段' });
     assert.equal(host.leaves.length, 1, 'each selection should not create another chat window');
     assert.equal(host.leafOperations.filter(operation => operation.action === 'reveal').at(-1).leaf, original);
     assert.equal(host.calls.length, 0);
     assert.equal(host.plugin.messages.length, 0);
     assert.equal(host.plugin.selectedQuote.text, '新的选段');
+    assert.notEqual(host.plugin.session.id, originalSessionId, 'reusing the window must still start a fresh conversation');
   }
 });
 
@@ -277,6 +280,204 @@ test('selection discussion: concurrent selections open one desktop window and re
   assert.equal(host.leaves[0].kind, 'popout');
   assert.deepEqual(plain(host.plugin.selectedQuote), latest);
   assert.equal(host.calls.length, 0);
+  assert.equal([...host.records.keys()].filter(name => name.endsWith('/会话.json')).length, 1,
+    'overlapping selections must create one conversation');
+});
+
+test('selection discussion: default starts fresh and keeps previous messages in history without sending them to the model', async () => {
+  const host = await ready();
+  await host.plugin.send('旧会话独有的正文-不要带入选段讨论');
+  const previous = plain(host.plugin.session);
+  const previousMessages = plain(host.plugin.messages);
+  const previousFiles = [...host.records].filter(([name]) => name.startsWith(`概念漫游/会话/${previous.id}/`))
+    .map(([name, record]) => [name, record.text]);
+  await host.plugin.openChat();
+  const originalWindow = host.leaves[0];
+
+  await host.plugin.prepareNoteDiscussion(selectedPassage);
+  assert.notEqual(host.plugin.session.id, previous.id);
+  assert.equal(host.plugin.messages.length, 0);
+  assert.equal(host.plugin.chain().length, 0);
+  assert.equal(host.plugin.activeLeaf, null);
+  assert.equal(host.calls.length, 1, 'preparing a passage must not issue a model request');
+  assert.equal(host.leaves.length, 1);
+  assert.equal(host.leaves[0], originalWindow, 'the existing chat window should display the new conversation');
+  assert.deepEqual(plain(await host.plugin.store.messages(previous.id)), previousMessages);
+  assert.ok((await host.plugin.store.sessions()).some(session => session.id === previous.id));
+  assert.deepEqual(previousFiles.map(([name]) => [name, host.records.get(name).text]), previousFiles);
+
+  await host.plugin.send('解释新的选段', host.plugin.selectedQuote);
+  assert.equal(host.calls.length, 2);
+  assert.equal(host.calls[1].messages.length, 2, 'fresh payload contains the system prompt and the new user question');
+  assert.equal(JSON.stringify(host.calls[1]).includes('旧会话独有的正文'), false);
+  assert.ok(host.calls[1].messages.at(-1).content.includes(selectedPassage.text));
+  assert.deepEqual(plain(await host.plugin.store.messages(previous.id)), previousMessages);
+});
+
+test('selection discussion: editor menu offers fresh discussion and explicit continuation with distinct session behavior', async () => {
+  const host = await ready();
+  await host.plugin.send('上一个话题');
+  const originalId = host.plugin.session.id;
+  const originalMessages = plain(host.plugin.messages);
+  const menu = selectionMenu();
+  host.emitWorkspace('editor-menu', menu, { getSelection: () => selectedPassage.text }, { file: new TFile(selectedPassage.path) });
+  const discuss = menu.items.find(item => item.title === '在漫游中讨论');
+  const continueCurrent = menu.items.find(item => item.title === '在当前漫游中继续');
+  assert.ok(discuss);
+  assert.ok(continueCurrent);
+
+  continueCurrent.callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(host.plugin.session.id, originalId);
+  assert.deepEqual(plain(host.plugin.messages), originalMessages);
+  assert.deepEqual(plain(host.plugin.selectedQuote), selectedPassage);
+
+  discuss.callback();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.notEqual(host.plugin.session.id, originalId);
+  assert.equal(host.plugin.messages.length, 0);
+  assert.deepEqual(plain(host.plugin.selectedQuote), selectedPassage);
+  assert.equal(host.calls.length, 1);
+});
+
+test('selection discussion: continuation command preserves the current conversation and checking availability changes nothing', async () => {
+  const host = await ready();
+  await host.plugin.send('已有问题');
+  const originalId = host.plugin.session.id;
+  const originalMessages = plain(host.plugin.messages);
+  const command = host.plugin.commands.get('continue-selection');
+  assert.ok(command);
+  assert.equal(command.checkCallback(true), false);
+  host.setActiveNoteView({ getMode: () => 'source', file: new TFile(selectedPassage.path),
+    editor: { getSelection: () => selectedPassage.text } });
+  assert.equal(command.checkCallback(true), true);
+  assert.equal(host.plugin.selectedQuote, null);
+  assert.equal(host.plugin.session.id, originalId);
+  assert.equal(command.checkCallback(false), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(host.plugin.session.id, originalId);
+  assert.deepEqual(plain(host.plugin.messages), originalMessages);
+  assert.deepEqual(plain(host.plugin.selectedQuote), selectedPassage);
+  assert.equal(host.calls.length, 1);
+});
+
+test('selection discussion: busy or unsaved reply rejects a fresh discussion before changing conversation or attachment', async () => {
+  for (const reason of ['busy', 'unsaved']) {
+    const host = await ready();
+    await host.plugin.send('已有会话');
+    await host.plugin.prepareNoteDiscussion(selectedPassage, true);
+    if (reason === 'busy') host.plugin.state = 'connecting';
+    else {
+      host.failSave(true);
+      await host.plugin.send('尚未保存的回复');
+      assert.equal(host.plugin.hasPendingSave(), true);
+    }
+    const originalId = host.plugin.session.id;
+    const originalMessages = plain(host.plugin.messages);
+    const originalQuote = host.plugin.selectedQuote;
+    const originalLeaf = host.plugin.activeLeaf;
+    const originalSessionCount = [...host.records.keys()].filter(name => name.endsWith('/会话.json')).length;
+    await assert.rejects(host.plugin.prepareNoteDiscussion({ ...selectedPassage, text: '不能替换的选段' }),
+      reason === 'busy' ? /等待/ : /重试保存/);
+    assert.equal(host.plugin.session.id, originalId);
+    assert.equal(host.plugin.selectedQuote, originalQuote);
+    assert.equal(host.plugin.activeLeaf, originalLeaf);
+    assert.deepEqual(plain(host.plugin.messages), originalMessages);
+    assert.equal([...host.records.keys()].filter(name => name.endsWith('/会话.json')).length, originalSessionCount);
+    assert.equal(host.plugin.state, reason === 'busy' ? 'connecting' : 'idle');
+    if (reason === 'busy') host.plugin.state = 'idle';
+    host.plugin.onunload();
+  }
+});
+
+test('selection discussion: failed fresh-session creation preserves the previous conversation and selection', async () => {
+  const host = await ready();
+  await host.plugin.send('已有会话');
+  await host.plugin.prepareNoteDiscussion(selectedPassage, true);
+  const previous = host.plugin.session;
+  const previousMessages = host.plugin.messages;
+  const previousLeaf = host.plugin.activeLeaf;
+  const previousQuote = host.plugin.selectedQuote;
+  const activeBefore = plain(host.storage.get('concept-roamer:active-v1'));
+  const create = host.app.vault.create;
+  host.app.vault.create = async (name, text) => {
+    if (name.endsWith('/会话.json')) throw new Error('new session disk write failed');
+    return create(name, text);
+  };
+  await assert.rejects(host.plugin.prepareNoteDiscussion({ ...selectedPassage, text: '新的选段' }), /new session disk write failed/);
+  assert.equal(host.plugin.session, previous);
+  assert.equal(host.plugin.messages, previousMessages);
+  assert.equal(host.plugin.activeLeaf, previousLeaf);
+  assert.equal(host.plugin.selectedQuote, previousQuote);
+  assert.equal(host.plugin.state, 'idle');
+  assert.deepEqual(plain(host.storage.get('concept-roamer:active-v1')), activeBefore);
+  assert.equal(host.calls.length, 1);
+});
+
+test('selection discussion: creating a fresh session blocks send and another new session until durable creation completes', async () => {
+  const host = await ready();
+  await host.plugin.send('旧的会话');
+  const oldId = host.plugin.session.id;
+  let reachedCreate;
+  let releaseCreate;
+  const reached = new Promise(resolve => { reachedCreate = resolve; });
+  const blocked = new Promise(resolve => { releaseCreate = resolve; });
+  const create = host.app.vault.create;
+  host.app.vault.create = async (name, text) => {
+    if (name.endsWith('/会话.json')) { reachedCreate(); await blocked; }
+    return create(name, text);
+  };
+  const preparing = host.plugin.prepareNoteDiscussion(selectedPassage);
+  await reached;
+  assert.equal(host.plugin.state, 'saving');
+  assert.equal(host.plugin.session.id, oldId);
+  assert.equal(await host.plugin.send('不能发往旧会话'), false);
+  await assert.rejects(host.plugin.newSession(), /等待/);
+  assert.equal(host.calls.length, 1);
+  releaseCreate();
+  await preparing;
+  assert.equal(host.plugin.state, 'idle');
+  assert.notEqual(host.plugin.session.id, oldId);
+  assert.equal(host.plugin.messages.length, 0);
+  assert.deepEqual(plain(host.plugin.selectedQuote), selectedPassage);
+});
+
+test('selection discussion: sending while the chat window is being revealed does not reattach the accepted quotation', async () => {
+  const host = await ready();
+  let reachedReveal;
+  let releaseReveal;
+  const reached = new Promise(resolve => { reachedReveal = resolve; });
+  const blocked = new Promise(resolve => { releaseReveal = resolve; });
+  host.app.workspace.revealLeaf = async () => { reachedReveal(); await blocked; };
+  const preparing = host.plugin.prepareNoteDiscussion(selectedPassage);
+  await reached;
+  const quote = host.plugin.selectedQuote;
+  assert.deepEqual(plain(quote), selectedPassage);
+  assert.equal(await host.plugin.send('解释选中的文字', quote), true);
+  assert.equal(host.plugin.selectedQuote, null);
+  releaseReveal();
+  await preparing;
+  assert.equal(host.plugin.selectedQuote, null, 'finishing window reveal must not restore an already-sent attachment');
+  assert.deepEqual(plain(host.plugin.messages[0].noteQuote), selectedPassage);
+  assert.equal(host.calls.length, 1);
+});
+
+test('selection discussion: staged quotations follow their conversation when switching back through history', async () => {
+  const host = await ready();
+  await host.plugin.send('旧会话的问题');
+  await host.plugin.prepareNoteDiscussion(selectedPassage, true);
+  const previous = plain(host.plugin.session);
+  const nextPassage = { path: '阅读/新主题.md', title: '新主题', text: '新会话中选中的原文。' };
+  await host.plugin.prepareNoteDiscussion(nextPassage);
+  const next = plain(host.plugin.session);
+  assert.deepEqual(plain(host.plugin.selectedQuote), nextPassage);
+  await host.plugin.loadSession(previous);
+  assert.equal(host.plugin.session.id, previous.id);
+  assert.deepEqual(plain(host.plugin.selectedQuote), selectedPassage);
+  await host.plugin.loadSession(next);
+  assert.equal(host.plugin.session.id, next.id);
+  assert.deepEqual(plain(host.plugin.selectedQuote), nextPassage);
+  assert.equal(host.calls.length, 1);
 });
 
 test('selection discussion: the command supports the current editor selection without sending a model request', async () => {
@@ -333,7 +534,7 @@ test('selection discussion: persists source attribution separately and restores 
 test('selection discussion: an explicitly created session retains a source-aware provisional title after reload', async () => {
   const host = await ready();
   await host.plugin.newSession();
-  await host.plugin.prepareNoteDiscussion(selectedPassage);
+  await host.plugin.prepareNoteDiscussion(selectedPassage, true);
   assert.equal(await host.plugin.send('', host.plugin.selectedQuote), true);
   const title = host.plugin.session.title;
   assert.ok(title.includes(selectedPassage.title));
@@ -434,7 +635,7 @@ test('selection discussion: accepting an older attachment does not clear a newer
   };
   const sending = host.plugin.send('解释旧的选段', originalQuote);
   await reached;
-  await host.plugin.prepareNoteDiscussion({ path: '阅读/新概念.md', title: '新概念', text: '这是后来选中的文字。' });
+  await host.plugin.prepareNoteDiscussion({ path: '阅读/新概念.md', title: '新概念', text: '这是后来选中的文字。' }, true);
   const newerQuote = host.plugin.selectedQuote;
   host.plugin.clearSelectedQuote(originalQuote);
   assert.equal(host.plugin.selectedQuote, newerQuote);
@@ -451,11 +652,12 @@ test('selection discussion: excerpt and encoded combined-input limits reject bef
   const host = await ready();
   await host.plugin.prepareNoteDiscussion(selectedPassage);
   const staged = host.plugin.selectedQuote;
+  const stagedSession = host.plugin.session;
   await assert.rejects(host.plugin.send('解释', { ...selectedPassage, text: '段'.repeat(8_001) }));
   await assert.rejects(host.plugin.send('问'.repeat(12_000), { ...selectedPassage, text: '段'.repeat(8_000) }));
   assert.equal(host.plugin.selectedQuote, staged);
   assert.equal(host.calls.length, 0);
-  assert.equal(host.plugin.session, null);
+  assert.equal(host.plugin.session, stagedSession, 'invalid input keeps the already-created empty conversation');
   assert.equal(host.plugin.messages.length, 0);
 });
 
@@ -495,6 +697,8 @@ test('selection discussion: reading menu captures a passage in its own window an
   assert.equal(host.shownMenus.length, 1);
   const discuss = host.shownMenus[0].menu.items.find(item => item.title === '在漫游中讨论');
   assert.ok(discuss);
+  assert.ok(host.shownMenus[0].menu.items.some(item => item.title === '在当前漫游中继续'),
+    'reading-mode menus should expose the same explicit continuation choice');
   currentText = '打开菜单后选择变化';
   view.file = new TFile('阅读/另一篇笔记.md');
   discuss.callback();

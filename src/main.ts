@@ -54,6 +54,9 @@ export default class ConceptRoamer extends Plugin {
   selectedQuote: NoteQuote | null = null;
   private noteDocuments = new WeakSet<Document>();
   private discussionWindow: Promise<void> | null = null;
+  private discussionQuote: NoteQuote | null = null;
+  private discussionContinues = false;
+  private quoteDrafts = new Map<string, NoteQuote>();
 
   async onload(): Promise<void> {
     const saved: unknown = await this.loadData();
@@ -186,19 +189,27 @@ export default class ConceptRoamer extends Plugin {
       menu.addItem(item => item.setTitle('在漫游中讨论').setIcon('messages-square').onClick(() => {
         void this.prepareNoteDiscussion(quote).catch(error => new Notice(this.safeError(error)));
       }));
+      menu.addItem(item => item.setTitle('在当前漫游中继续').setIcon('message-square-plus').onClick(() => {
+        void this.prepareNoteDiscussion(quote, true).catch(error => new Notice(this.safeError(error)));
+      }));
     }));
     this.registerEvent(this.app.workspace.on('window-open', (_workspaceWindow, win) => {
       this.registerNoteDocument(win.document);
     }));
-    this.addCommand({
-      id: 'discuss-selection', name: '在漫游中讨论选中文字',
-      checkCallback: checking => {
-        const quote = this.activeNoteQuote();
-        if (!quote) return false;
-        if (!checking) void this.prepareNoteDiscussion(quote).catch(error => new Notice(this.safeError(error)));
-        return true;
-      },
-    });
+    for (const command of [
+      { id: 'discuss-selection', name: '在漫游中讨论选中文字', continuing: false },
+      { id: 'continue-selection', name: '在当前漫游中继续讨论选中文字', continuing: true },
+    ]) {
+      this.addCommand({
+        id: command.id, name: command.name,
+        checkCallback: checking => {
+          const quote = this.activeNoteQuote();
+          if (!quote) return false;
+          if (!checking) void this.prepareNoteDiscussion(quote, command.continuing).catch(error => new Notice(this.safeError(error)));
+          return true;
+        },
+      });
+    }
   }
 
   private activeNoteQuote(): NoteQuote | null {
@@ -241,6 +252,9 @@ export default class ConceptRoamer extends Plugin {
       menu.addItem(item => item.setTitle('在漫游中讨论').setIcon('messages-square').onClick(() => {
         void this.prepareNoteDiscussion(quote).catch(error => new Notice(this.safeError(error)));
       }));
+      menu.addItem(item => item.setTitle('在当前漫游中继续').setIcon('message-square-plus').onClick(() => {
+        void this.prepareNoteDiscussion(quote, true).catch(error => new Notice(this.safeError(error)));
+      }));
       const clipboard = doc.defaultView?.navigator.clipboard;
       if (clipboard) {
         menu.addItem(item => item.setTitle('复制').setIcon('copy').onClick(() => {
@@ -251,14 +265,32 @@ export default class ConceptRoamer extends Plugin {
     }, { capture: true });
   }
 
-  async prepareNoteDiscussion(quote: NoteQuote): Promise<void> {
+  async prepareNoteDiscussion(quote: NoteQuote, continueCurrent = false): Promise<void> {
     await this.ready;
-    this.selectedQuote = noteQuote(quote.text, quote.path, quote.title);
-    this.emit();
+    const captured = noteQuote(quote.text, quote.path, quote.title);
+    if (this.discussionWindow && this.discussionContinues !== continueCurrent) {
+      throw new Error('正在打开选文讨论，请稍后再选择另一种讨论方式。');
+    }
+    if (!this.discussionWindow && !continueCurrent) {
+      if (this.state !== 'idle') throw new Error('请等待当前回复保存完成，再开始新的选文讨论。');
+      if (this.pending) throw new Error('请先重试保存当前回复，再开始新的选文讨论。');
+    }
+    this.discussionQuote = captured;
     if (!this.discussionWindow) {
-      const existing = this.app.workspace.getLeavesOfType(VIEW)[0];
-      this.discussionWindow = this.openChat(!existing && Platform.isDesktopApp)
-        .finally(() => { this.discussionWindow = null; });
+      this.discussionContinues = continueCurrent;
+      this.discussionWindow = (async () => {
+        if (!continueCurrent) await this.newSession();
+        const staged = this.discussionQuote;
+        this.selectedQuote = staged;
+        this.emit();
+        const existing = this.app.workspace.getLeavesOfType(VIEW)[0];
+        await this.openChat(!existing && Platform.isDesktopApp);
+        // A later click while the window is opening replaces the staged selection.
+        if (this.discussionQuote !== staged) {
+          this.selectedQuote = this.discussionQuote;
+          this.emit();
+        }
+      })().finally(() => { this.discussionWindow = null; this.discussionQuote = null; });
     }
     await this.discussionWindow;
     const view = this.app.workspace.getLeavesOfType(VIEW)[0]?.view;
@@ -275,14 +307,28 @@ export default class ConceptRoamer extends Plugin {
     await this.ready;
     if (this.state !== 'idle') throw new Error('请等待回复保存完成，再创建新会话。');
     if (this.pending) throw new Error('请先重试保存当前回复。');
-    const session: Session = { schemaVersion: 1, id: newId(), title: '新的探索', createdAt: new Date().toISOString() };
-    await this.store.createSession(session);
-    this.session = session;
-    this.messages = [];
-    this.activeLeaf = null;
-    this.saveActive();
-    this.status = '新的会话已建立。';
+    this.state = 'saving';
+    const previousStatus = this.status;
+    this.status = '正在建立新会话…';
     this.emit();
+    try {
+      const session: Session = { schemaVersion: 1, id: newId(), title: '新的探索', createdAt: new Date().toISOString() };
+      await this.store.createSession(session);
+      this.rememberQuoteDraft();
+      this.session = session;
+      this.messages = [];
+      this.activeLeaf = null;
+      this.selectedQuote = null;
+      this.saveActive();
+      this.status = '新的会话已建立。';
+    } catch (error) { this.status = previousStatus; throw error; }
+    finally { this.state = 'idle'; this.emit(); }
+  }
+
+  private rememberQuoteDraft(): void {
+    const key = this.session?.id ?? 'new';
+    if (this.selectedQuote) this.quoteDrafts.set(key, this.selectedQuote);
+    else this.quoteDrafts.delete(key);
   }
 
   private saveActive(): void {
@@ -297,9 +343,11 @@ export default class ConceptRoamer extends Plugin {
     else if (leaves.length === 1) activeLeaf = leaves[0].id;
     else if (leaves.length > 1) this.status = '此会话有多个分支，请选择一个分支继续。';
     if (activeLeaf) messageChain(messages, activeLeaf);
+    this.rememberQuoteDraft();
     this.session = session;
     this.messages = messages;
     this.activeLeaf = activeLeaf;
+    this.selectedQuote = this.quoteDrafts.get(session.id) ?? null;
     this.saveActive();
   }
 
@@ -764,6 +812,8 @@ class ChatView extends ItemView {
   private quoteSource!: HTMLButtonElement;
   private quotePreview!: HTMLElement;
   private renderedQuote: NoteQuote | null | undefined;
+  private composerSession: string | undefined;
+  private composerDrafts = new Map<string, string>();
   private unsubscribe: (() => void) | undefined;
   private rows = new Map<string, { bubble: HTMLElement; text: HTMLElement; label?: HTMLElement; component: Component; rendered?: string }>();
   private updateTimer: number | undefined;
@@ -879,6 +929,7 @@ class ChatView extends ItemView {
     this.input = footer.createEl('textarea', {
       cls: 'cr-input', attr: { placeholder: '你最近对什么感到好奇？', rows: '3', 'aria-label': '聊天输入' },
     });
+    this.composerSession = this.plugin.session?.id ?? 'new';
     const actions = footer.createDiv({ cls: 'cr-actions' });
     actions.createSpan({ text: 'Enter 发送 · Shift + Enter 换行', cls: 'cr-hint' });
     this.saveButton = this.button(actions, '重试保存', () => this.plugin.retrySave());
@@ -894,6 +945,8 @@ class ChatView extends ItemView {
       }
     });
     this.unsubscribe = this.plugin.subscribe(() => {
+      // Capture drafts at the transition, before the deferred render can skip a session.
+      this.syncComposerDraft();
       if (this.updateTimer) return;
       this.updateTimer = this.contentEl.win.setTimeout(() => { this.updateTimer = undefined; this.update(); }, 32);
     });
@@ -930,8 +983,23 @@ class ChatView extends ItemView {
   }
 
   focusComposer(): void {
+    this.syncComposerDraft();
     this.updateQuoteCard();
     this.input?.focus();
+  }
+
+  private syncComposerDraft(): void {
+    if (!this.input) return;
+    const key = this.plugin.session?.id ?? 'new';
+    if (this.composerSession === key) return;
+    // The first send gives an existing composer its durable session ID.
+    if (this.composerSession === 'new' && this.plugin.state === 'connecting') {
+      this.composerSession = key;
+      return;
+    }
+    if (this.composerSession !== undefined) this.composerDrafts.set(this.composerSession, this.input.value);
+    this.input.value = this.composerDrafts.get(key) ?? '';
+    this.composerSession = key;
   }
 
   private updateQuoteCard(): void {
@@ -949,6 +1017,7 @@ class ChatView extends ItemView {
 
   private update(): void {
     if (!this.list) return;
+    this.syncComposerDraft();
     this.updateQuoteCard();
     const busy = this.plugin.state !== 'idle';
     this.sendButton.disabled = busy;
