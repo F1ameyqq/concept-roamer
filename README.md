@@ -26,7 +26,7 @@ The API key is managed through Obsidian SecretStorage. Plugin settings store the
 
 ## Installation and use
 
-This plugin has not yet been published to the community directory. For manual installation, copy `main.js`, `manifest.json`, and `styles.css` from a GitHub release into `.obsidian/plugins/concept-roamer/` inside your vault, then enable **概念漫游** in Community plugins.
+This plugin has not yet been published to the community directory. For manual installation, copy `main.js`, `manifest.json`, and `styles.css` from a GitHub release into `.obsidian/plugins/concept-roamer/` inside your vault, then enable **Concept Roamer** in Community plugins. The chat interface and commands use Chinese labels.
 
 1. Set your DeepSeek key and a model available to your account in plugin settings.
 2. Open the chat with the ribbon icon or the **打开聊天** command.
@@ -42,7 +42,7 @@ Sources mentioned in the conversation are marked as unverified. Review model out
 
 Windows uses a desktop-only HTTPS transport; Android uses browser `fetch` and `ReadableStream`. Desktop Node APIs are guarded by `Platform.isDesktopApp`.
 
-The current build passes 42 local tests. Its preview, edit, save, and reading behavior were tested in Chrome using a simulated Obsidian host and model response. Android WebView streaming and device synchronization still require real-device validation before a public compatibility claim. Desktop behavior has been tried by the project owner; this does not establish compatibility across other installations.
+The current build passes 43 local tests. Its preview, edit, save, and reading behavior were tested in Chrome using a simulated Obsidian host and model response. Android WebView streaming and device synchronization still require real-device validation before a public compatibility claim. Desktop behavior has been tried by the project owner; this does not establish compatibility across other installations.
 
 ## Development
 
