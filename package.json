@@ -1,0 +1,25 @@
+{
+  "name": "concept-roamer",
+  "version": "0.2.1",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/F1ameyqq/concept-roamer.git"
+  },
+  "scripts": {
+    "build": "tsc --noEmit && node build.mjs",
+    "test": "node build.mjs && tsx --test tests/*.test.ts tests/*.test.cjs",
+    "lint": "eslint src",
+    "check:release": "node scripts/check-release.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "0.28.2",
+    "eslint": "^10.11.0",
+    "eslint-plugin-obsidianmd": "^0.4.2",
+    "obsidian": "1.13.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "id": "concept-roamer",
+  "name": "概念漫游",
+  "version": "0.2.1",
+  "minAppVersion": "1.11.4",
+  "description": "Discuss concepts with DeepSeek, organize Markdown notes, and link them to your knowledge graph.",
+  "author": "Qingqing",
+  "isDesktopOnly": false
+}
