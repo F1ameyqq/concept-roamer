@@ -7,6 +7,9 @@ await build({
   platform: 'browser',
   format: 'cjs',
   target: 'es2020',
+  // Obsidian evaluates CommonJS plugins in a renderer. Lower the guarded desktop
+  // import to require so Chromium does not try to resolve a browser module URL.
+  supported: { 'dynamic-import': false },
   external: ['obsidian', 'https'],
   outfile: 'dist/concept-roamer/main.js',
   minify: false,

@@ -618,8 +618,8 @@ export default class ConceptRoamer extends Plugin {
   }
 
   private safeError(error: unknown): string {
-    if (error instanceof TypeError) return '网络请求失败，请检查连接与 WebView 的跨域兼容性。';
-    const message = error instanceof Error ? error.message : '操作失败，请重试。';
+    const message = error instanceof Error
+      ? `${error instanceof TypeError ? '插件运行错误：' : ''}${error.message}` : '操作失败，请重试。';
     // Avoid retaining an API key even if a platform error echoes it.
     const key = this.app.secretStorage?.getSecret(this.settings.secretName);
     return (key ? message.split(key).join('[密钥已隐藏]') : message).slice(0, 500);

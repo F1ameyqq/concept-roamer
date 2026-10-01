@@ -36,13 +36,22 @@ export function statusError(status: number): Error {
 export async function streamBrowser(input: StreamRequest): Promise<void> {
   if (input.signal.aborted) throw abortError();
   // requestUrl buffers the complete response and cannot supply the required streaming reader.
-  const response = await fetch(input.url, {
+  const options: RequestInit = {
     method: 'POST',
     headers: { Authorization: `Bearer ${input.apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(input.payload),
     signal: input.signal,
     cache: 'no-store',
-  });
+  };
+  let response: Response;
+  try { response = await fetch(input.url, options); }
+  catch (error) {
+    if (input.signal.aborted) throw abortError();
+    if (error instanceof TypeError) {
+      throw new Error('Web 流式连接失败，请检查网络与 WebView 的跨域兼容性。');
+    }
+    throw error;
+  }
   if (!response.ok) { await response.body?.cancel(); throw statusError(response.status); }
   if (!response.headers.get('content-type')?.includes('text/event-stream')) {
     await response.body?.cancel();

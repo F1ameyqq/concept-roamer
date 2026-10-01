@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
 const { webcrypto } = require('node:crypto');
 const bundle = fs.readFileSync(process.env.CONCEPT_ROAMER_TEST_BUNDLE ??
   path.join(__dirname, '../dist/concept-roamer/main.js'), 'utf8');
@@ -23,8 +24,12 @@ class BasePlugin {
 class Empty {}
 
 function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-test-key', responder,
-  indexVisible = true, layoutInitiallyReady = true, raceFolderPath, automaticTitles = false } = {}) {
+  indexVisible = true, layoutInitiallyReady = true, raceFolderPath, automaticTitles = false,
+  platform = { isDesktop: false, isDesktopApp: false, isMobileApp: true }, transport = 'auto', httpsRequest } = {}) {
   const calls = [];
+  const fetchCalls = [];
+  const moduleLoads = [];
+  const nativeRequests = [];
   const createAttempts = [];
   const layoutCallbacks = [];
   let layoutReady = layoutInitiallyReady;
@@ -33,7 +38,7 @@ function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-te
     Plugin: BasePlugin, ItemView: Empty, PluginSettingTab: Empty, SuggestModal: Empty,
     Component: Empty, Modal: Empty, SecretComponent: Empty, Setting: Empty, Notice: Empty,
     TFile, TFolder, normalizePath: path => path,
-    Platform: { isDesktopApp: false, isMobileApp: true },
+    Platform: platform,
   };
   const app = {
     workspace: {
@@ -81,24 +86,54 @@ function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-te
       read: async file => records.get(file.path).text,
     },
   };
+  const respond = options => responder ? responder(options) : new Response(
+    'data: {"choices":[{"delta":{"content":"回答"},"finish_reason":null}]}\n\n' +
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    { headers: { 'content-type': 'text/event-stream' } });
+  const nativeRequest = (url, options, callback) => {
+    nativeRequests.push({ url, options });
+    if (httpsRequest) return httpsRequest(url, options, callback);
+    const request = new EventEmitter();
+    request.destroy = () => { request.destroyed = true; return request; };
+    request.end = body => {
+      calls.push(JSON.parse(body));
+      void Promise.resolve().then(async () => {
+        const result = await respond({ body });
+        const response = new EventEmitter();
+        response.statusCode = result.status;
+        response.headers = Object.fromEntries(result.headers);
+        response.destroy = () => { response.destroyed = true; return response; };
+        callback(response);
+        const bytes = new Uint8Array(await result.arrayBuffer());
+        if (!response.destroyed) response.emit('data', bytes);
+        if (!response.destroyed) response.emit('end');
+      }).catch(error => request.emit('error', error));
+      return request;
+    };
+    return request;
+  };
   const module = { exports: {} };
   vm.runInNewContext(bundle, {
     module, exports: module.exports,
-    require: name => { if (name === 'obsidian') return obsidian; throw new Error(`Unexpected module ${name}`); },
+    require: name => {
+      moduleLoads.push(name);
+      if (name === 'obsidian') return obsidian;
+      if (name === 'https') return { request: nativeRequest };
+      throw new Error(`Unexpected module ${name}`);
+    },
     crypto: webcrypto, TextDecoder, TextEncoder, AbortController, Error, TypeError,
     setTimeout, clearTimeout, console, window: { setTimeout, clearTimeout },
     fetch: async (url, options) => {
-      calls.push(JSON.parse(options.body));
-      return responder ? responder(options) : new Response(
-        'data: {"choices":[{"delta":{"content":"回答"},"finish_reason":null}]}\n\n' +
-        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
-        { headers: { 'content-type': 'text/event-stream' } });
+      const payload = JSON.parse(options.body);
+      calls.push(payload);
+      fetchCalls.push(payload);
+      return respond(options);
     },
   }, { filename: 'concept-roamer/main.js' });
   const plugin = new module.exports.default(app);
-  plugin.loadData = async () => ({ automaticTitles });
+  plugin.loadData = async () => ({ automaticTitles, transport });
   return {
-    plugin, app, records, storage, calls, createAttempts,
+    plugin, app, records, storage, calls, fetchCalls, moduleLoads, nativeRequests, createAttempts,
     failSave: value => { failAssistantSave = value; },
     finishLayout: () => { layoutReady = true; layoutCallbacks.splice(0).forEach(callback => callback()); },
   };
@@ -273,6 +308,72 @@ function titleResponder(options) {
   const payload = JSON.parse(options.body);
   return streamedText(payload.response_format ? '{"title":"路径依赖与改变的成本"}' : '完整的回答');
 }
+
+test('desktop bundle: guarded CommonJS https streams chat and automatic title without browser fetch', async () => {
+  const host = await ready({
+    platform: { isDesktop: true, isDesktopApp: true, isMobileApp: false },
+    automaticTitles: true, responder: titleResponder,
+  });
+  assert.equal(host.moduleLoads.includes('https'), false, 'desktop module is not loaded during startup');
+  await host.plugin.send('什么是路径依赖？');
+  await host.plugin.updateAutomaticTitle();
+  assert.equal(host.plugin.messages[1].status, 'complete');
+  assert.equal(host.plugin.messages[1].content, '完整的回答');
+  assert.equal(host.plugin.session.title, '路径依赖与改变的成本');
+  assert.equal(host.nativeRequests.length, 2);
+  assert.equal(host.calls.length, 2);
+  assert.equal(host.fetchCalls.length, 0);
+  assert.equal(host.moduleLoads.filter(name => name === 'https').length, 2);
+  assert.equal(host.nativeRequests[0].url, 'https://api.deepseek.com/chat/completions');
+  assert.equal(host.nativeRequests[0].options.headers.Accept, 'text/event-stream');
+  host.plugin.onunload();
+});
+
+for (const [label, platform, transport] of [
+  ['Android', { isDesktop: false, isDesktopApp: false, isMobileApp: true }, 'auto'],
+  ['desktop with Web transport', { isDesktop: true, isDesktopApp: true, isMobileApp: false }, 'browser'],
+]) {
+  test(`platform routing: ${label} streams chat and title without loading https`, async () => {
+    const host = await ready({ platform, transport, automaticTitles: true, responder: titleResponder });
+    await host.plugin.send('什么是路径依赖？');
+    await host.plugin.updateAutomaticTitle();
+    assert.equal(host.plugin.messages[1].status, 'complete');
+    assert.equal(host.plugin.session.title, '路径依赖与改变的成本');
+    assert.equal(host.fetchCalls.length, 2);
+    assert.equal(host.nativeRequests.length, 0);
+    assert.equal(host.moduleLoads.includes('https'), false);
+    host.plugin.onunload();
+  });
+}
+
+test('desktop runtime TypeError retains diagnostic detail and hides the API key in saved errors', async () => {
+  const apiKey = 'sk-fake-desktop-key';
+  const host = await ready({
+    platform: { isDesktop: true, isDesktopApp: true, isMobileApp: false }, apiKey,
+    httpsRequest: () => { throw new TypeError(`Desktop loader failed for ${apiKey}`); },
+  });
+  await host.plugin.send('问题');
+  assert.equal(host.plugin.messages[1].status, 'error');
+  assert.equal(host.plugin.messages[1].error, '插件运行错误：Desktop loader failed for [密钥已隐藏]');
+  assert.equal(host.plugin.status, host.plugin.messages[1].error);
+  assert.equal(host.plugin.messages[1].content, '');
+  assert.equal(host.nativeRequests.length, 1);
+  assert.equal(host.fetchCalls.length, 0);
+  assert.equal(JSON.stringify([...host.records]).includes(apiKey), false);
+  assert.equal(JSON.stringify([...host.storage]).includes(apiKey), false);
+  host.plugin.onunload();
+});
+
+test('browser fetch TypeError reports a Web connection failure instead of a plugin runtime error', async () => {
+  const host = await ready({ responder: () => { throw new TypeError('Failed to fetch'); } });
+  await host.plugin.send('问题');
+  assert.equal(host.plugin.messages[1].status, 'error');
+  assert.match(host.plugin.messages[1].error, /Web 流式连接失败/);
+  assert.doesNotMatch(host.plugin.messages[1].error, /插件运行错误/);
+  assert.equal(host.fetchCalls.length, 1);
+  assert.equal(host.moduleLoads.includes('https'), false);
+  host.plugin.onunload();
+});
 
 test('automatic title is persisted and restored without adding a chat turn or sending persona and memory', async () => {
   const host = await ready({ automaticTitles: true, responder: titleResponder });

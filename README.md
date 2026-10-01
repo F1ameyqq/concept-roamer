@@ -45,7 +45,9 @@ Sources mentioned in the conversation are marked as unverified. Review model out
 
 Windows uses a desktop-only HTTPS transport; Android uses browser `fetch` and `ReadableStream`. Desktop Node APIs are guarded by `Platform.isDesktopApp`.
 
-The current build passes 58 local tests. Its automatic title display, manual naming, preview, edit, save, and reading behavior were tested in Chrome using a simulated Obsidian host and model response. Android WebView streaming and device synchronization still require real-device validation before a public compatibility claim. Desktop behavior has been tried by the project owner; this does not establish compatibility across other installations.
+Version 0.2.4 fixes the desktop module-loading failure exposed by upgrading from 0.2.0. The build lowers guarded imports to CommonJS loading, so the renderer does not resolve Node modules as browser URLs. Runtime errors retain their details; browser connection failures are handled at the request boundary.
+
+The current build passes 63 local tests, including the compiled desktop chat and title request path, guarded module loading, and error reporting. The emitted module loader also passed isolated Chrome checks for desktop and mobile routing. Its automatic title display, manual naming, preview, edit, save, and reading behavior were tested in Chrome using a simulated Obsidian host and model response. Android WebView streaming and device synchronization still require real-device validation before a public compatibility claim. Desktop behavior has been tried by the project owner; this does not establish compatibility across other installations.
 
 ## Development
 
