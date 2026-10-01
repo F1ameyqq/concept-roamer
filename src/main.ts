@@ -5,6 +5,7 @@ import {
 import { Message, Session, newId, leafMessages, messageChain, contextMessages } from './model';
 import { MEMORY, PERSONA, ROOT, VaultStore } from './store';
 import { abortError, streamBrowser, streamNode, StreamRequest } from './transport';
+import { conversationTitle, parseConversationTitle, provisionalTitle, titleMessages } from './titles';
 import {
   ConceptDraft, OrganizationInput, RelatedNote, conceptBody, conceptMarkdown, noteScore,
   organizationMessages, parseConceptResult, safeNoteTitle, summaryMarkdown, summaryPath,
@@ -20,9 +21,11 @@ interface Settings {
   model: string;
   thinking: boolean;
   transport: 'auto' | 'browser';
+  automaticTitles: boolean;
 }
 const DEFAULTS: Settings = {
   secretName: 'concept-roamer-deepseek', model: 'deepseek-flash', thinking: false, transport: 'auto',
+  automaticTitles: true,
 };
 
 type ChatState = 'idle' | 'connecting' | 'streaming' | 'saving';
@@ -45,6 +48,7 @@ export default class ConceptRoamer extends Plugin {
   private pending: Message | null = null;
   private unloading = false;
   private draftAt = 0;
+  private titleJobs = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   conceptDraft: ConceptDraft | null = null;
 
   async onload(): Promise<void> {
@@ -55,6 +59,7 @@ export default class ConceptRoamer extends Plugin {
       model: typeof fields.model === 'string' ? fields.model : DEFAULTS.model,
       thinking: typeof fields.thinking === 'boolean' ? fields.thinking : DEFAULTS.thinking,
       transport: fields.transport === 'browser' ? 'browser' : 'auto',
+      automaticTitles: typeof fields.automaticTitles === 'boolean' ? fields.automaticTitles : DEFAULTS.automaticTitles,
     };
     this.store = new VaultStore(this.app);
     this.registerView(VIEW, leaf => new ChatView(leaf, this));
@@ -72,6 +77,7 @@ export default class ConceptRoamer extends Plugin {
     this.addCommand({ id: 'open-persona', name: '编辑人格', callback: () => { void this.openNote(PERSONA); } });
     this.addCommand({ id: 'open-memory', name: '编辑全局记忆', callback: () => { void this.openNote(MEMORY); } });
     this.addCommand({ id: 'organize-concept', name: '整理并保存概念笔记', callback: () => { void this.openOrganizer(); } });
+    this.addCommand({ id: 'rename-conversation', name: '修改当前会话标题', callback: () => { void this.openTitleEditor(); } });
     this.ready = new Promise<void>((resolve, reject) => {
       this.app.workspace.onLayoutReady(() => {
         if (this.unloading) { reject(new Error('插件已关闭。')); return; }
@@ -90,6 +96,7 @@ export default class ConceptRoamer extends Plugin {
     this.unloading = true;
     if (this.pending) this.app.saveLocalStorage(DRAFT, this.pending);
     this.controller?.abort();
+    this.titleJobs.forEach(job => job.controller.abort());
     this.listeners.clear();
   }
 
@@ -126,6 +133,7 @@ export default class ConceptRoamer extends Plugin {
     const selected = sessions.find(session => session.id === active?.sessionId) ?? sessions[0];
     if (selected) await this.loadSession(selected, active?.leafId);
     this.emit();
+    void this.updateAutomaticTitle().catch(() => undefined);
   }
 
   subscribe(listener: () => void): () => void {
@@ -195,17 +203,10 @@ export default class ConceptRoamer extends Plugin {
     if (this.pending) throw new Error('请先重试保存当前回复。');
     const sessions = await this.store.sessions();
     if (!sessions.length) { new Notice('还没有保存的会话。'); return; }
-    const titles = new Map<string, string>();
-    for (const session of sessions) {
-      const messages = await this.store.messages(session.id);
-      const first = messages.filter(message => message.role === 'user')
-        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
-      titles.set(session.id, first?.content.slice(0, 45) ?? session.title);
-    }
     new Picker(this.app, sessions,
-      session => `${titles.get(session.id)} · ${new Date(session.createdAt).toLocaleString()}`,
+      session => `${session.title} · ${new Date(session.createdAt).toLocaleString()}`,
       async session => {
-        try { await this.loadSession(session); this.emit(); }
+        try { await this.loadSession(session); this.emit(); void this.updateAutomaticTitle().catch(() => undefined); }
         catch (error) { new Notice(this.safeError(error)); }
       }).open();
   }
@@ -251,6 +252,7 @@ export default class ConceptRoamer extends Plugin {
     let accepted = false;
     let timedOut = false;
     let timer: number | undefined;
+    let savedCompleteReply = false;
     try {
       const [persona, memory] = await Promise.all([this.store.text(PERSONA), this.store.text(MEMORY)]);
       if (controller.signal.aborted) throw abortError();
@@ -258,7 +260,7 @@ export default class ConceptRoamer extends Plugin {
         throw new Error('人格或记忆超过验证版的 8,000 字符限制，请精简后再发送。');
       }
       if (!this.session) {
-        const session: Session = { schemaVersion: 1, id: newId(), title: text.slice(0, 45), createdAt: new Date().toISOString() };
+        const session: Session = { schemaVersion: 1, id: newId(), title: provisionalTitle(text), createdAt: new Date().toISOString() };
         await this.store.createSession(session);
         this.session = session;
         this.messages = [];
@@ -275,6 +277,7 @@ export default class ConceptRoamer extends Plugin {
       await this.store.saveMessage(user);
       accepted = true;
       this.messages.push(user);
+      if (this.session.title === '新的探索' && !this.session.titleRevisionId) this.session.title = provisionalTitle(text);
       this.activeLeaf = user.id;
       this.saveActive();
       const assistant: Message = {
@@ -346,6 +349,7 @@ export default class ConceptRoamer extends Plugin {
       this.emit();
       await this.store.saveMessage(assistant);
       this.pending = null;
+      savedCompleteReply = assistant.status === 'complete';
       this.app.saveLocalStorage(DRAFT, null);
       this.status = assistant.error ?? (assistant.status === 'truncated' ? '回复达到输出限制，已保留。' : '回复已保存。');
     } catch (error) {
@@ -357,6 +361,7 @@ export default class ConceptRoamer extends Plugin {
       this.controller = null;
       this.state = 'idle';
       this.emit();
+      if (savedCompleteReply && !this.unloading) void this.updateAutomaticTitle().catch(() => undefined);
     }
     return accepted;
   }
@@ -373,11 +378,88 @@ export default class ConceptRoamer extends Plugin {
   async retrySave(): Promise<void> {
     if (!this.pending || this.state !== 'idle') return;
     if (this.pending.status === 'streaming') this.pending.status = 'interrupted';
+    const savedCompleteReply = this.pending.status === 'complete';
     await this.store.saveMessage(this.pending);
     this.pending = null;
     this.app.saveLocalStorage(DRAFT, null);
     this.status = '回复已保存。';
     this.emit();
+    if (savedCompleteReply && !this.unloading) void this.updateAutomaticTitle().catch(() => undefined);
+  }
+
+  async updateAutomaticTitle(): Promise<void> {
+    await this.ready;
+    if (!this.settings.automaticTitles || this.unloading || !this.session || this.pending) return;
+    const session = { ...this.session };
+    const chain = this.chain().map(message => ({ ...message }));
+    const last = chain[chain.length - 1];
+    if (last?.role !== 'assistant' || last.status !== 'complete') return;
+    const existing = this.titleJobs.get(session.id);
+    if (existing) return existing.promise;
+    const controller = new AbortController();
+    const promise = this.generateTitle(session, chain, controller).catch(() => {
+      // Naming failures must not turn a saved reply into an error or block chat.
+    }).finally(() => { if (this.titleJobs.get(session.id)?.controller === controller) this.titleJobs.delete(session.id); });
+    this.titleJobs.set(session.id, { controller, promise });
+    return promise;
+  }
+
+  private async generateTitle(session: Session, chain: Message[], controller: AbortController): Promise<void> {
+    const current = await this.store.sessionTitle(session);
+    const turns = chain.filter(message => message.role === 'assistant' && message.status === 'complete').length;
+    if (current.titleMode === 'manual' || (current.titleCompletedTurns !== undefined &&
+        (current.titleLeafId === chain[chain.length - 1].id || turns < current.titleCompletedTurns + 3))) return;
+    const key = this.app.secretStorage?.getSecret(this.settings.secretName);
+    if (!key || controller.signal.aborted || !this.settings.automaticTitles) return;
+    let raw = '';
+    let finishReason: string | undefined;
+    const timer = window.setTimeout(() => controller.abort(), 30_000);
+    try {
+      await this.streamRequest({
+        url: 'https://api.deepseek.com/chat/completions', apiKey: key, signal: controller.signal,
+        payload: { model: this.settings.model.trim(), messages: titleMessages(chain, current.title),
+          stream: true, response_format: { type: 'json_object' }, max_tokens: 128,
+          thinking: { type: 'disabled' } },
+        onDelta: delta => {
+          if (delta.content) raw += delta.content;
+          if (raw.length > 2000) controller.abort();
+          if (delta.finishReason) finishReason = delta.finishReason;
+        },
+      });
+      if (controller.signal.aborted || this.unloading || !this.settings.automaticTitles || finishReason !== 'stop') return;
+      const title = parseConversationTitle(raw);
+      const latest = await this.store.sessionTitle(session);
+      if (controller.signal.aborted || latest.titleMode === 'manual' || latest.titleRevisionId !== current.titleRevisionId) return;
+      const updated = await this.store.saveTitle(latest, title, 'auto', 'model', turns, chain[chain.length - 1].id);
+      if (!this.unloading && this.session?.id === session.id) { this.session = updated; this.emit(); }
+    } finally { window.clearTimeout(timer); }
+  }
+
+  async setAutomaticTitles(enabled: boolean): Promise<void> {
+    this.settings.automaticTitles = enabled;
+    if (!enabled) this.titleJobs.forEach(job => job.controller.abort());
+    await this.saveData(this.settings);
+  }
+
+  async renameSession(title: string, automatic: boolean, expectedId = this.session?.id): Promise<void> {
+    await this.ready;
+    if (!this.session || this.session.id !== expectedId) throw new Error('会话已切换，请重新打开标题编辑。');
+    title = conversationTitle(title);
+    const session = await this.store.sessionTitle(this.session);
+    this.titleJobs.get(session.id)?.controller.abort();
+    const chain = this.chain();
+    const turns = chain.filter(message => message.role === 'assistant' && message.status === 'complete').length;
+    const updated = await this.store.saveTitle(session, title, automatic ? 'auto' : 'manual', 'user',
+      automatic ? 0 : turns, automatic ? null : this.activeLeaf);
+    if (this.session?.id === session.id) { this.session = updated; this.emit(); }
+  }
+
+  async openTitleEditor(): Promise<void> {
+    try {
+      await this.ready;
+      if (!this.session) throw new Error('请先开始一个会话。');
+      new TitleModal(this.app, this, this.session).open();
+    } catch (error) { new Notice(this.safeError(error)); }
   }
 
   hasPendingSave(): boolean { return !!this.pending && this.state === 'idle'; }
@@ -519,7 +601,7 @@ export default class ConceptRoamer extends Plugin {
     if (this.state !== 'idle' || !this.session) throw new Error('请在回复保存完成后导出。');
     const chain = this.chain();
     if (!chain.length) throw new Error('请先选择一个有内容的会话分支。');
-    const title = chain.find(message => message.role === 'user')?.content.split('\n')[0].slice(0, 60) ?? '讨论记录';
+    const title = this.session.title;
     const content = [
       '---', 'tags: [ai-session]', `session_id: ${this.session.id}`, '---', '',
       `# ${title}`, '', '> 原始对话记录。概念笔记请通过“整理并保存”生成。', '',
@@ -553,6 +635,8 @@ class ChatView extends ItemView {
   private status!: HTMLElement;
   private branchButton!: HTMLButtonElement;
   private latestButton!: HTMLButtonElement;
+  private conversationHeading!: HTMLElement;
+  private titleButton!: HTMLButtonElement;
   private unsubscribe: (() => void) | undefined;
   private rows = new Map<string, { bubble: HTMLElement; text: HTMLElement; label?: HTMLElement; component: Component; rendered?: string }>();
   private updateTimer: number | undefined;
@@ -577,10 +661,11 @@ class ChatView extends ItemView {
     const header = root.createDiv({ cls: 'cr-header' });
     const title = header.createDiv();
     title.createEl('strong', { text: '概念漫游' });
-    title.createDiv({ text: '从一个问题，聊到一个新概念', cls: 'cr-subtitle' });
+    this.conversationHeading = title.createDiv({ text: '从一个问题，聊到一个新概念', cls: 'cr-subtitle' });
     const tools = root.createDiv({ cls: 'cr-tools' });
     this.button(tools, '新会话', () => this.plugin.newSession());
     this.button(tools, '历史', () => this.plugin.chooseSession());
+    this.titleButton = this.button(tools, '标题', () => this.plugin.openTitleEditor());
     this.branchButton = this.button(tools, '分支', () => this.plugin.chooseBranch());
     this.button(tools, '人格', () => this.plugin.openNote(PERSONA));
     this.button(tools, '记忆', () => this.plugin.openNote(MEMORY));
@@ -713,6 +798,10 @@ class ChatView extends ItemView {
     this.stopButton.disabled = !['connecting', 'streaming'].includes(this.plugin.state);
     this.saveButton.toggleVisibility(this.plugin.hasPendingSave());
     this.status.setText(this.plugin.status);
+    const title = this.plugin.session?.title ?? '从一个问题，聊到一个新概念';
+    this.conversationHeading.setText(title);
+    this.conversationHeading.setAttr('title', title);
+    this.titleButton.disabled = !this.plugin.session;
     this.branchButton.disabled = busy || !this.plugin.session;
     let chain: Message[];
     try { chain = this.plugin.chain(); }
@@ -970,6 +1059,31 @@ class ConceptModal extends Modal {
   }
 }
 
+class TitleModal extends Modal {
+  constructor(app: App, private plugin: ConceptRoamer, private session: Session) { super(app); }
+  onOpen(): void {
+    const root = this.contentEl;
+    root.createEl('h2', { text: '会话标题' });
+    root.createEl('p', { text: '手动改名后默认保留这个标题。开启下方选项，可让后续讨论自动更新标题。' });
+    const input = root.createEl('input', { cls: 'cr-title-input',
+      attr: { type: 'text', 'aria-label': '会话标题', maxlength: '80' } });
+    input.value = this.session.title;
+    const label = root.createEl('label', { cls: 'cr-title-toggle' });
+    const automatic = label.createEl('input', { attr: { type: 'checkbox' } });
+    automatic.checked = false;
+    label.createSpan({ text: '允许自动更新这个会话标题' });
+    const status = root.createDiv({ cls: 'cr-status', attr: { 'aria-live': 'polite' } });
+    const save = root.createEl('button', { text: '保存标题', cls: 'mod-cta', attr: { type: 'button' } });
+    save.addEventListener('click', () => {
+      save.disabled = true;
+      void this.plugin.renameSession(input.value, automatic.checked, this.session.id).then(() => this.close())
+        .catch(error => { status.setText(error instanceof Error ? error.message : '标题保存失败。'); save.disabled = false; });
+    });
+    input.focus();
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
 class Picker<T> extends SuggestModal<T> {
   constructor(app: App, private items: T[], private label: (item: T) => string,
     private selected: (item: T) => void | Promise<void>) { super(app); this.setPlaceholder('搜索并选择…'); }
@@ -996,6 +1110,11 @@ class RoamerSettings extends PluginSettingTab {
     new Setting(root).setName('开启思考模式').setDesc('关闭时更快开始输出。开启后，思考阶段显示状态，正文仍逐步输出。')
       .addToggle(toggle => toggle.setValue(this.plugin.settings.thinking).onChange(value => {
         this.plugin.settings.thinking = value; void this.plugin.saveData(this.plugin.settings);
+      }));
+    new Setting(root).setName('自动更新会话标题')
+      .setDesc('首轮完整回复后命名，之后每增加三轮完整回复更新。每次会额外调用 DeepSeek，发送开头和近期对话片段，产生少量 API 费用。手动固定的标题不会更改。')
+      .addToggle(toggle => toggle.setValue(this.plugin.settings.automaticTitles).onChange(value => {
+        void this.plugin.setAutomaticTitles(value);
       }));
     new Setting(root).setName('流式传输').setDesc('自动：Windows 使用桌面传输，Android 使用 Web 传输。Web 可用于验证移动端路径。')
       .addDropdown(dropdown => dropdown.addOption('auto', '自动选择').addOption('browser', 'Web 流式传输')

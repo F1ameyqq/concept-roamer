@@ -12,6 +12,7 @@ Discuss concepts with DeepSeek in Obsidian and turn a conversation into an edita
 - Preview and edit generated Markdown before saving.
 - Suggestions for links to existing notes, plus a conversation summary.
 - Separate export of the original conversation.
+- Automatic conversation titles that evolve with the discussion, plus manual naming.
 - Desktop pop-out chat using Obsidian's window support.
 
 ## Requirements and external service
@@ -19,6 +20,8 @@ Discuss concepts with DeepSeek in Obsidian and turn a conversation into an edita
 Requires Obsidian 1.11.4 or later and your own DeepSeek API key. DeepSeek account access and API usage may require payment. The plugin itself does not include API credits.
 
 Requests go directly to `https://api.deepseek.com/chat/completions`. Chat requests send your messages, personality note, manual memory note, and the selected conversation branch. Concept organization also sends the opening snippets of up to eight relevant Markdown notes, selected by titles and aliases. A separate model request is made when you click **开始整理**.
+
+Automatic titles are enabled by default. Naming runs in the background after the first complete reply, then after every three additional complete replies. Opening an older conversation can also name it if it has no generated title. Each naming operation makes an additional DeepSeek request with bounded opening and recent conversation excerpts, without the personality or memory notes; normal API charges apply. Disable it in settings or use **标题** to save a fixed manual title. Naming failures preserve the current title and do not block chat.
 
 The plugin does not include analytics, a developer-operated proxy, or an updater. DeepSeek handles submitted content according to its own service terms and [privacy policy](https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html).
 
@@ -42,7 +45,7 @@ Sources mentioned in the conversation are marked as unverified. Review model out
 
 Windows uses a desktop-only HTTPS transport; Android uses browser `fetch` and `ReadableStream`. Desktop Node APIs are guarded by `Platform.isDesktopApp`.
 
-The current build passes 43 local tests. Its preview, edit, save, and reading behavior were tested in Chrome using a simulated Obsidian host and model response. Android WebView streaming and device synchronization still require real-device validation before a public compatibility claim. Desktop behavior has been tried by the project owner; this does not establish compatibility across other installations.
+The current build passes 58 local tests. Its automatic title display, manual naming, preview, edit, save, and reading behavior were tested in Chrome using a simulated Obsidian host and model response. Android WebView streaming and device synchronization still require real-device validation before a public compatibility claim. Desktop behavior has been tried by the project owner; this does not establish compatibility across other installations.
 
 ## Development
 

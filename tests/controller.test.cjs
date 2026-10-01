@@ -23,7 +23,7 @@ class BasePlugin {
 class Empty {}
 
 function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-test-key', responder,
-  indexVisible = true, layoutInitiallyReady = true, raceFolderPath } = {}) {
+  indexVisible = true, layoutInitiallyReady = true, raceFolderPath, automaticTitles = false } = {}) {
   const calls = [];
   const createAttempts = [];
   const layoutCallbacks = [];
@@ -96,6 +96,7 @@ function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-te
     },
   }, { filename: 'concept-roamer/main.js' });
   const plugin = new module.exports.default(app);
+  plugin.loadData = async () => ({ automaticTitles });
   return {
     plugin, app, records, storage, calls, createAttempts,
     failSave: value => { failAssistantSave = value; },
@@ -261,6 +262,190 @@ function organizationResponder(options) {
     'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
     { headers: { 'content-type': 'text/event-stream' } });
 }
+
+function streamedText(body, finishReason = 'stop') {
+  return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content: body }, finish_reason: null }] })}\n\n` +
+    `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: finishReason }] })}\n\ndata: [DONE]\n\n`,
+    { headers: { 'content-type': 'text/event-stream' } });
+}
+
+function titleResponder(options) {
+  const payload = JSON.parse(options.body);
+  return streamedText(payload.response_format ? '{"title":"路径依赖与改变的成本"}' : '完整的回答');
+}
+
+test('automatic title is persisted and restored without adding a chat turn or sending persona and memory', async () => {
+  const host = await ready({ automaticTitles: true, responder: titleResponder });
+  await host.plugin.send('什么是路径依赖？');
+  await host.plugin.updateAutomaticTitle();
+  assert.equal(host.plugin.session.title, '路径依赖与改变的成本');
+  assert.equal(host.plugin.messages.length, 2);
+  assert.equal(host.calls.length, 2);
+  assert.equal(host.calls[1].thinking.type, 'disabled');
+  assert.equal(host.calls[1].max_tokens, 128);
+  assert.equal(host.calls[1].messages.length, 2);
+  assert.equal(JSON.stringify(host.calls[1]).includes('用户明确保存的背景与偏好'), false);
+  const original = [...host.records].find(([name]) => name.endsWith('/会话.json'))[1].text;
+  assert.equal(JSON.parse(original).title, '什么是路径依赖？', 'original metadata remains immutable');
+  host.plugin.onunload();
+  const restored = await ready({ records: host.records, storage: host.storage });
+  assert.equal(restored.plugin.session.title, '路径依赖与改变的成本');
+});
+
+test('automatic naming is enabled by default for existing settings', async () => {
+  const host = await ready({ automaticTitles: null, responder: titleResponder });
+  assert.equal(host.plugin.settings.automaticTitles, true);
+  await host.plugin.send('什么是路径依赖？');
+  await host.plugin.updateAutomaticTitle();
+  assert.equal(host.plugin.session.title, '路径依赖与改变的成本');
+});
+
+test('automatic titles update after three more completed turns and respect a manually fixed title', async () => {
+  const host = await ready({ automaticTitles: true, responder: titleResponder });
+  for (let turn = 1; turn <= 4; turn++) {
+    await host.plugin.send(`第 ${turn} 个问题`);
+    await host.plugin.updateAutomaticTitle();
+    assert.equal(host.calls.filter(call => call.response_format).length, turn === 4 ? 2 : 1);
+  }
+  await host.plugin.renameSession('我保存的概念讨论', false);
+  for (let turn = 0; turn < 3; turn++) {
+    await host.plugin.send('继续讨论');
+    await host.plugin.updateAutomaticTitle();
+  }
+  assert.equal(host.plugin.session.title, '我保存的概念讨论');
+  assert.equal(host.calls.filter(call => call.response_format).length, 2);
+  await host.plugin.renameSession('恢复自动命名', true);
+  await host.plugin.send('讨论转换成本');
+  await host.plugin.updateAutomaticTitle();
+  assert.equal(host.plugin.session.title, '路径依赖与改变的成本');
+});
+
+test('background naming does not block chat and cannot replace the title of a different session', async () => {
+  let releaseTitle;
+  let titleStarted;
+  const started = new Promise(resolve => { titleStarted = resolve; });
+  const waiting = new Promise(resolve => { releaseTitle = resolve; });
+  const host = await ready({ automaticTitles: true, responder: async options => {
+    if (JSON.parse(options.body).response_format) { titleStarted(); await waiting; }
+    return titleResponder(options);
+  } });
+  await host.plugin.send('什么是路径依赖？');
+  await started;
+  const previousId = host.plugin.session.id;
+  const naming = host.plugin.updateAutomaticTitle();
+  assert.equal(host.plugin.state, 'idle');
+  assert.equal(host.plugin.hasPendingSave(), false);
+  await host.plugin.newSession();
+  releaseTitle();
+  await naming;
+  assert.equal(host.plugin.session.title, '新的探索');
+  const sessions = await host.plugin.store.sessions();
+  assert.equal(sessions.find(session => session.id === previousId).title, '路径依赖与改变的成本');
+});
+
+test('manual rename wins while model naming is in flight', async () => {
+  let releaseTitle;
+  let titleStarted;
+  const started = new Promise(resolve => { titleStarted = resolve; });
+  const waiting = new Promise(resolve => { releaseTitle = resolve; });
+  const host = await ready({ automaticTitles: true, responder: async options => {
+    if (JSON.parse(options.body).response_format) { titleStarted(); await waiting; }
+    return titleResponder(options);
+  } });
+  await host.plugin.send('什么是路径依赖？');
+  await started;
+  const naming = host.plugin.updateAutomaticTitle();
+  await host.plugin.renameSession('保留这个手动标题', false);
+  releaseTitle();
+  await naming;
+  assert.equal(host.plugin.session.title, '保留这个手动标题');
+  assert.equal(host.plugin.session.titleMode, 'manual');
+});
+
+test('malformed or truncated naming leaves the saved answer and title intact', async () => {
+  for (const [titleBody, finishReason] of [['无效 JSON', 'stop'], ['{"title":"不完整"}', 'length']]) {
+    const host = await ready({ automaticTitles: true, responder: options => JSON.parse(options.body).response_format
+      ? streamedText(titleBody, finishReason) : streamedText('完整回答') });
+    await host.plugin.send('什么是路径依赖？');
+    await host.plugin.updateAutomaticTitle();
+    assert.equal(host.plugin.session.title, '什么是路径依赖？');
+    assert.equal(host.plugin.messages[1].status, 'complete');
+    assert.equal(host.plugin.status, '回复已保存。');
+    assert.equal(host.plugin.hasPendingSave(), false);
+  }
+});
+
+test('disabling automatic titles creates no naming request; incomplete replies are not named', async () => {
+  const disabled = await ready({ responder: titleResponder });
+  await disabled.plugin.send('什么是路径依赖？');
+  await disabled.plugin.updateAutomaticTitle();
+  assert.equal(disabled.calls.length, 1);
+  const incomplete = await ready({ automaticTitles: true, responder: () => streamedText('达到限制', 'length') });
+  await incomplete.plugin.send('什么是路径依赖？');
+  await incomplete.plugin.updateAutomaticTitle();
+  assert.equal(incomplete.calls.length, 1);
+});
+
+test('a title storage failure does not change saved reply status or prevent another message', async () => {
+  const host = await ready({ automaticTitles: true, responder: titleResponder });
+  const originalCreate = host.app.vault.create;
+  host.app.vault.create = async (name, text) => {
+    if (name.includes('/标题/')) throw new Error('title storage unavailable');
+    return originalCreate(name, text);
+  };
+  await host.plugin.send('什么是路径依赖？');
+  await host.plugin.updateAutomaticTitle();
+  assert.equal(host.plugin.session.title, '什么是路径依赖？');
+  assert.equal(host.plugin.status, '回复已保存。');
+  assert.equal(host.plugin.hasPendingSave(), false);
+  assert.equal(await host.plugin.send('再举一个例子'), true);
+  await host.plugin.updateAutomaticTitle();
+});
+
+test('an explicitly created chat retains a useful provisional title if naming fails', async () => {
+  const host = await ready({ automaticTitles: true, responder: options => streamedText(
+    JSON.parse(options.body).response_format ? '无效命名结果' : '完整回答') });
+  await host.plugin.newSession();
+  await host.plugin.send('为什么会产生路径依赖？');
+  await host.plugin.updateAutomaticTitle();
+  assert.equal(host.plugin.session.title, '为什么会产生路径依赖？');
+  const restored = await ready({ records: host.records, storage: host.storage });
+  assert.equal(restored.plugin.session.title, '为什么会产生路径依赖？');
+});
+
+test('opening an existing chat can name it without inserting a new message', async () => {
+  const original = await ready({ responder: titleResponder });
+  await original.plugin.send('什么是路径依赖？');
+  original.plugin.onunload();
+  const restored = await ready({ records: original.records, storage: original.storage,
+    automaticTitles: true, responder: titleResponder });
+  await restored.plugin.updateAutomaticTitle();
+  assert.equal(restored.plugin.session.title, '路径依赖与改变的成本');
+  assert.equal(restored.plugin.messages.length, 2);
+  assert.equal(restored.calls.length, 1);
+});
+
+test('disabling naming or unloading discards an in-flight title response', async () => {
+  for (const action of ['disable', 'unload']) {
+    let releaseTitle;
+    let titleStarted;
+    const started = new Promise(resolve => { titleStarted = resolve; });
+    const waiting = new Promise(resolve => { releaseTitle = resolve; });
+    const host = await ready({ automaticTitles: true, responder: async options => {
+      if (JSON.parse(options.body).response_format) { titleStarted(); await waiting; }
+      return titleResponder(options);
+    } });
+    await host.plugin.send('什么是路径依赖？');
+    await started;
+    const naming = host.plugin.updateAutomaticTitle();
+    if (action === 'disable') await host.plugin.setAutomaticTitles(false);
+    else host.plugin.onunload();
+    releaseTitle();
+    await naming;
+    assert.equal(host.plugin.session.title, '什么是路径依赖？');
+    assert.equal([...host.records.keys()].filter(name => name.includes('/标题/')).length, 0);
+  }
+});
 
 test('concept workflow: second model call organizes discussion; saving creates a note and a linked summary', async () => {
   const host = await ready({ responder: organizationResponder });

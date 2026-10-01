@@ -9,6 +9,7 @@
 }
 .concept-roamer .cr-header strong { font-size: 1.15em; letter-spacing: .03em; }
 .concept-roamer .cr-subtitle { color: var(--text-muted); font-size: .82em; margin-top: 4px; }
+.concept-roamer .cr-subtitle { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .concept-roamer .cr-tools { display: flex; flex-wrap: wrap; gap: 5px; }
 .concept-roamer button { min-height: 32px; font-size: .82em; }
 .concept-roamer .cr-tools button { padding: 4px 9px; }
@@ -49,3 +50,5 @@
 .cr-organize-modal .cr-organize-preview { line-height: 1.7; }
 .cr-organize-modal .cr-organize-hint { color: var(--text-muted); font-size: .8em; }
 .cr-organize-modal .cr-organize-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
+.cr-title-input { width: 100%; margin-bottom: 12px; }
+.cr-title-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }

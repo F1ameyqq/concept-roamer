@@ -1,7 +1,7 @@
 {
   "id": "concept-roamer",
   "name": "Concept Roamer",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "minAppVersion": "1.11.4",
   "description": "Discuss concepts with DeepSeek, organize Markdown notes, and link them to your knowledge graph.",
   "author": "Qingqing",

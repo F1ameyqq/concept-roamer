@@ -17,6 +17,10 @@ export interface Session {
   id: string;
   title: string;
   createdAt: string;
+  titleMode?: 'auto' | 'manual';
+  titleRevisionId?: string;
+  titleCompletedTurns?: number;
+  titleLeafId?: string | null;
 }
 
 export function newId(): string {

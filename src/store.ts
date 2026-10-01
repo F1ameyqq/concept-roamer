@@ -1,6 +1,7 @@
 import { App, normalizePath, TFile, TFolder } from 'obsidian';
-import { Message, Session } from './model';
+import { Message, Session, newId } from './model';
 import { safeNoteTitle } from './organize';
+import { TitleRevision, applyTitleRevisions, conversationTitle, provisionalTitle } from './titles';
 
 export const ROOT = '概念漫游';
 export const PERSONA = `${ROOT}/人格.md`;
@@ -56,6 +57,43 @@ export class VaultStore {
     await this.folder(`${root}/消息`);
     await this.createOnce(`${root}/会话.json`, JSON.stringify(session, null, 2));
   }
+  async sessionTitle(session: Session): Promise<Session> {
+    if (session.title === '新的探索' && !session.titleRevisionId) {
+      try {
+        const messages = await this.messages(session.id);
+        const first = messages.filter(message => message.role === 'user').sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+        if (first) session = { ...session, title: provisionalTitle(first.content) };
+      } catch { /* Keep the placeholder until the message files finish syncing. */ }
+    }
+    const folder = `${ROOT}/会话/${session.id}/标题`;
+    if (!await this.kind(folder)) return session;
+    const revisions: TitleRevision[] = [];
+    const files = (await this.app.vault.adapter.list(folder)).files;
+    for (const path of files) {
+      try {
+        const revision = JSON.parse(await this.text(path)) as TitleRevision;
+        if (revision.schemaVersion !== 1 || revision.sessionId !== session.id ||
+            !/^[0-9a-f-]{36}$/.test(revision.id) || path !== `${folder}/${revision.id}.json` ||
+            (revision.parentRevisionId !== null && !/^[0-9a-f-]{36}$/.test(revision.parentRevisionId)) ||
+            (revision.mode !== 'auto' && revision.mode !== 'manual') ||
+            (revision.origin !== 'model' && revision.origin !== 'user') ||
+            typeof revision.createdAt !== 'string' || !Number.isFinite(Date.parse(revision.createdAt)) ||
+            !Number.isInteger(revision.completedTurns) || revision.completedTurns < 0 ||
+            (revision.leafId !== null && !/^[0-9a-f-]{36}$/.test(revision.leafId))) continue;
+        revision.title = conversationTitle(revision.title);
+        revisions.push(revision);
+      } catch { /* Incomplete synced title revisions do not hide the chat. */ }
+    }
+    return applyTitleRevisions(session, revisions);
+  }
+  async saveTitle(session: Session, title: string, mode: 'auto' | 'manual', origin: 'model' | 'user',
+    completedTurns: number, leafId: string | null): Promise<Session> {
+    const revision: TitleRevision = { schemaVersion: 1, id: newId(), sessionId: session.id,
+      parentRevisionId: session.titleRevisionId ?? null, title: conversationTitle(title), mode, origin,
+      completedTurns, leafId, createdAt: new Date().toISOString() };
+    await this.writeSnapshot(`${ROOT}/会话/${session.id}/标题/${revision.id}.json`, JSON.stringify(revision, null, 2));
+    return this.sessionTitle(session);
+  }
   async createConcept(title: string, id: string, content: string): Promise<string> {
     const folder = `${ROOT}/概念`;
     await this.folder(folder);
@@ -110,7 +148,7 @@ export class VaultStore {
         const entry = JSON.parse(await this.text(path)) as Session;
         if (entry.schemaVersion === 1 && typeof entry.id === 'string' &&
             typeof entry.createdAt === 'string' && typeof entry.title === 'string' &&
-            path === `${ROOT}/会话/${entry.id}/会话.json`) result.push(entry);
+            path === `${ROOT}/会话/${entry.id}/会话.json`) result.push(await this.sessionTitle(entry));
       } catch { /* A synchronizing or malformed record is not opened. */ }
     }
     return result.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
