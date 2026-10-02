@@ -4,7 +4,7 @@ import {
 } from 'obsidian';
 import { Message, NoteQuote, Session, newId, leafMessages, messageChain, contextMessages } from './model';
 import { messageText, noteQuote, quoteMarkdown } from './selection';
-import { MEMORY, PERSONA, ROOT, VaultStore } from './store';
+import { MEMORY, PERSONA, ROOT, VaultStore, NoteCandidate, NoteRevision, noteSourceHash, noteContentHash } from './store';
 import { abortError, streamBrowser, streamNode, StreamRequest } from './transport';
 import { conversationTitle, parseConversationTitle, provisionalTitle, titleMessages } from './titles';
 import {
@@ -15,11 +15,29 @@ import {
   ConceptDraft, OrganizationInput, RelatedNote, conceptBody, conceptMarkdown, noteScore,
   organizationMessages, parseConceptResult, safeNoteTitle, summaryMarkdown, summaryPath,
 } from './organize';
+import {
+  NoteUpdateInput, NoteUpdateResult, noteUpdateMessages, parseNoteUpdateResult, compileNoteUpdate,
+  newDiscussionMessages, splitNoteContent,
+} from './note-update';
 
 const VIEW = 'concept-roamer-chat';
 const DRAFT = 'concept-roamer:pending-v1';
 const ACTIVE = 'concept-roamer:active-v1';
 const CONCEPT_DRAFT = 'concept-roamer:concept-draft-v1';
+const NOTE_UPDATE_DRAFT = 'concept-roamer:note-update-draft-v1';
+
+interface NoteUpdateDraft {
+  schemaVersion: 1;
+  id: string;
+  createdAt: string;
+  model: string;
+  input: NoteUpdateInput;
+  result: NoteUpdateResult;
+  target: NoteCandidate;
+  revision: NoteRevision;
+  editedBody?: string;
+  savedNote?: { path: string; content: string };
+}
 
 interface Settings {
   secretName: string;
@@ -58,6 +76,7 @@ export default class ConceptRoamer extends Plugin {
   private draftAt = 0;
   private titleJobs = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   conceptDraft: ConceptDraft | null = null;
+  noteUpdateDraft: NoteUpdateDraft | null = null;
   selectedQuote: NoteQuote | null = null;
   private noteDocuments = new WeakSet<Document>();
   private discussionWindow: Promise<void> | null = null;
@@ -133,6 +152,23 @@ export default class ConceptRoamer extends Plugin {
         }
         this.conceptDraft = concept;
       } catch { this.status = '上次整理草稿无法读取，原会话仍可使用。'; }
+    }
+    const update = this.app.loadLocalStorage(NOTE_UPDATE_DRAFT) as NoteUpdateDraft | null;
+    if (update?.schemaVersion === 1 && /^[0-9a-f-]{36}$/.test(update.id) &&
+        update.revision?.id === update.id && update.revision?.noteId === update.target?.noteId &&
+        update.revision?.sessionId === update.input?.sessionId && update.revision?.leafId === update.input?.newLeafId &&
+        Array.isArray(update.revision?.coveredMessageIds) && /^[0-9a-f]{64}$/.test(update.revision?.sourceHash)) {
+      try {
+        update.result = parseNoteUpdateResult(JSON.stringify(update.result), update.input);
+        compileNoteUpdate(update.input, update.result);
+        if (update.editedBody !== undefined && (typeof update.editedBody !== 'string' || update.editedBody.length > 150_000)) {
+          throw new Error('更新草稿内容不正确。');
+        }
+        if (update.savedNote && (typeof update.savedNote.path !== 'string' || typeof update.savedNote.content !== 'string')) {
+          throw new Error('更新草稿保存状态不正确。');
+        }
+        this.noteUpdateDraft = update;
+      } catch { this.status = '上次笔记修订草稿无法读取，原笔记仍保留。'; }
     }
     const draft = this.app.loadLocalStorage(DRAFT) as Message | null;
     if (draft?.schemaVersion === 1 && /^[0-9a-f-]{36}$/.test(draft.id) &&
@@ -868,6 +904,7 @@ export default class ConceptRoamer extends Plugin {
     await this.ready;
     if (this.state !== 'idle' || this.pending) throw new Error('请先等待当前回复保存完成。');
     if (this.conceptDraft?.savedNote) throw new Error('请先继续保存上一份笔记的摘要，再开始新的整理。');
+    if (this.noteUpdateDraft?.savedNote) throw new Error('请先完成上一份笔记修订的摘要保存。');
     if (!this.session || !this.activeLeaf) throw new Error('请先选择一个完整的会话分支。');
     const messages = this.chain().filter(message => message.role === 'user' || message.status === 'complete')
       .map(message => ({ ...message }));
@@ -940,6 +977,11 @@ export default class ConceptRoamer extends Plugin {
     this.status = '保存概念笔记与讨论摘要…';
     this.emit();
     try {
+      const covered = messageChain(await this.store.messages(draft.input.sessionId), draft.input.leafId);
+      const organized = covered.filter(message => message.role === 'user' || message.status === 'complete');
+      if (await noteSourceHash(organized) !== await noteSourceHash(draft.input.messages)) {
+        throw new Error('原始讨论已经变化，请重新整理后保存。');
+      }
       if (!draft.savedNote) {
         const content = conceptMarkdown(draft, title, body);
         const path = await this.store.createConcept(title, draft.id, content);
@@ -947,6 +989,12 @@ export default class ConceptRoamer extends Plugin {
         this.conceptDraft = draft;
         this.app.saveLocalStorage(CONCEPT_DRAFT, draft);
       }
+      await this.store.saveNoteRevision({
+        schemaVersion: 1, id: draft.id, noteId: draft.id, sessionId: draft.input.sessionId,
+        path: draft.savedNote.path, leafId: draft.input.leafId, coveredMessageIds: covered.map(message => message.id),
+        sourceHash: await noteSourceHash(covered), contentHash: await noteContentHash(draft.savedNote.content),
+        createdAt: draft.createdAt, mode: 'create',
+      });
       await this.store.writeSnapshot(summaryPath(draft), summaryMarkdown(draft, draft.savedNote.path));
       const path = draft.savedNote.path;
       if (this.conceptDraft?.id === draft.id) {
@@ -957,6 +1005,154 @@ export default class ConceptRoamer extends Plugin {
       return path;
     } catch (error) {
       this.status = draft.savedNote ? '概念笔记已保存，摘要保存失败。请重试保存。' : this.safeError(error);
+      throw new Error(this.status);
+    } finally { this.state = 'idle'; this.emit(); }
+  }
+
+  async noteCandidates(): Promise<NoteCandidate[]> {
+    await this.ready;
+    return this.session ? this.store.noteCandidates(this.session.id, this.chain()) : [];
+  }
+
+  async generateNoteUpdate(targetPath: string, onProgress?: (characters: number) => void): Promise<NoteUpdateDraft> {
+    await this.ready;
+    if (this.state !== 'idle' || this.pending) throw new Error('请先等待当前回复保存完成。');
+    if (this.conceptDraft?.savedNote || this.noteUpdateDraft?.savedNote) {
+      throw new Error('请先完成上一份笔记或修订的摘要保存。');
+    }
+    if (!this.session || !this.activeLeaf) throw new Error('请先选择一个完整的会话分支。');
+    const sessionId = this.session.id;
+    const leafId = this.activeLeaf;
+    const covered = this.chain().map(message => ({ ...message }));
+    const key = this.app.secretStorage?.getSecret(this.settings.secretName);
+    if (!key) throw new Error('请先配置 DeepSeek API Key。');
+    if (!this.settings.model.trim()) throw new Error('请先填写模型名称。');
+    const controller = new AbortController();
+    this.controller = controller;
+    this.state = 'connecting';
+    this.status = '准备笔记当前内容与新增讨论…';
+    this.emit();
+    let timedOut = false;
+    const timer = window.setTimeout(() => { timedOut = true; controller.abort(); }, 300_000);
+    let raw = '';
+    let finishReason: string | undefined;
+    try {
+      const target = (await this.store.noteCandidates(sessionId, covered)).find(note => note.path === targetPath);
+      if (!target || !target.matchingBranch) throw new Error('这篇笔记未关联当前完整分支，请选择保存为新笔记。');
+      const messages = newDiscussionMessages(covered, target.leafId);
+      if (!messages.some(message => message.role === 'assistant' && message.status === 'complete')) {
+        throw new Error('上次整理后还没有新的完整回复，请继续讨论后再更新。');
+      }
+      const current = await this.store.readConceptNote(target);
+      const query = messages.filter(message => message.role === 'user').map(messageText).join('\n').slice(-5000);
+      const input: NoteUpdateInput = {
+        currentNote: current.content, path: current.path, sessionId,
+        coveredLeafId: target.leafId, newLeafId: leafId, messages,
+        relatedNotes: (await this.relatedNotes(query, messages.flatMap(message => message.noteQuote ? [message.noteQuote] : [])))
+          .filter(note => note.path !== current.path),
+      };
+      const prompts = noteUpdateMessages(input);
+      if (prompts.reduce((sum, message) => sum + message.content.length, 0) > 140_000) {
+        throw new Error('原笔记与新增讨论超过修订预算，请减少笔记内容或保存为新笔记。');
+      }
+      if (controller.signal.aborted) throw abortError();
+      const model = this.settings.model.trim();
+      await this.streamRequest({
+        url: 'https://api.deepseek.com/chat/completions', apiKey: key, signal: controller.signal,
+        payload: { model, messages: prompts, stream: true, stream_options: { include_usage: true },
+          max_tokens: 8192, thinking: { type: 'disabled' }, response_format: { type: 'json_object' } },
+        onDelta: delta => {
+          this.state = 'streaming';
+          raw += delta.content ?? '';
+          if (raw.length > 200_000) throw new Error('笔记修订超过大小限制，已停止读取。');
+          if (delta.finishReason) finishReason = delta.finishReason;
+          this.status = '正在整理笔记修订…';
+          onProgress?.(raw.length);
+          this.emit();
+        },
+      });
+      if (controller.signal.aborted || this.unloading) throw abortError();
+      if (finishReason !== 'stop') throw new Error('笔记修订未完整生成，请重新整理。');
+      const result = parseNoteUpdateResult(raw, input);
+      compileNoteUpdate(input, result);
+      const id = newId();
+      const createdAt = new Date().toISOString();
+      const revision: NoteRevision = {
+        schemaVersion: 1, id, noteId: target.noteId, sessionId: input.sessionId, path: current.path,
+        leafId: input.newLeafId, coveredMessageIds: covered.map(message => message.id),
+        sourceHash: await noteSourceHash(covered), createdAt, mode: 'update',
+        ...(target.revision ? { previousRevisionId: target.revision.id } : {}),
+      };
+      const draft: NoteUpdateDraft = { schemaVersion: 1, id, createdAt, model, input, result,
+        target: { ...target, path: current.path }, revision };
+      this.noteUpdateDraft = draft;
+      this.app.saveLocalStorage(NOTE_UPDATE_DRAFT, draft);
+      this.status = '修订已生成，请检查修改对照后保存。';
+      return draft;
+    } catch (error) {
+      this.status = timedOut ? '笔记修订超过 5 分钟，已停止。' : controller.signal.aborted ? '笔记修订已停止。' : this.safeError(error);
+      throw new Error(this.status);
+    } finally {
+      window.clearTimeout(timer);
+      this.controller = null;
+      this.state = 'idle';
+      this.emit();
+    }
+  }
+
+  async saveNoteUpdate(draft: NoteUpdateDraft, body: string): Promise<string> {
+    if (this.state !== 'idle' || this.pending) throw new Error('请先等待当前操作完成。');
+    if (!body.trim() || body.length > 150_000) throw new Error('笔记内容为空或超过保存限制。');
+    if (this.session?.id !== draft.input.sessionId) throw new Error('请先回到生成这份修订的会话。');
+    this.state = 'saving';
+    this.status = '保存笔记修订、旧版本与讨论摘要…';
+    this.emit();
+    let content: string | undefined;
+    try {
+      const selected = this.chain().slice(0, draft.revision.coveredMessageIds.length);
+      const covered = messageChain(await this.store.messages(draft.input.sessionId), draft.input.newLeafId);
+      if (selected.length !== draft.revision.coveredMessageIds.length ||
+          selected.some((message, index) => message.id !== draft.revision.coveredMessageIds[index]) ||
+          covered.some((message, index) => message.id !== draft.revision.coveredMessageIds[index]) ||
+          covered.length !== draft.revision.coveredMessageIds.length || await noteSourceHash(covered) !== draft.revision.sourceHash) {
+        throw new Error('当前分支或原始讨论已经变化，请回到对应分支或重新整理。');
+      }
+      const compiled = compileNoteUpdate(draft.input, draft.result);
+      content = draft.savedNote?.content ?? (body === compiled.body || body === compiled.body.replace(/\r\n/g, '\n')
+        ? compiled.content : `${splitNoteContent(draft.input.currentNote).prefix}${body}`);
+      draft.editedBody = body;
+      this.noteUpdateDraft = draft;
+      this.app.saveLocalStorage(NOTE_UPDATE_DRAFT, draft);
+      const revision = { ...draft.revision, contentHash: await noteContentHash(content) };
+      const path = await this.store.updateConceptNote(draft.target, draft.input.currentNote, content, revision);
+      draft.savedNote = { path, content };
+      draft.revision = revision;
+      this.noteUpdateDraft = draft;
+      this.app.saveLocalStorage(NOTE_UPDATE_DRAFT, draft);
+      const summary = ['---', 'tags: [ai-session]', `session_id: ${draft.input.sessionId}`,
+        `branch_leaf_id: ${draft.input.newLeafId}`, `created: ${JSON.stringify(draft.createdAt)}`, '---', '',
+        '# 笔记修订摘要', '', compiled.summary.replace(/\[\[/g, '\\[\\['), '', '## 更新的笔记', '',
+        `[[${path.replace(/\.md$/, '')}]]`, '', '## 修订前的版本', '',
+        `[[${ROOT}/会话/${draft.input.sessionId}/笔记版本/${draft.id}|修订前原文]]`, '',
+        '## 本次新增讨论', '', ...draft.input.messages.map(message => `- ${message.id} · ${message.role} · ${message.status}`), ''].join('\n');
+      await this.store.writeSnapshot(`${ROOT}/会话/${draft.input.sessionId}/整理摘要/${draft.id}.md`, summary);
+      if (this.noteUpdateDraft?.id === draft.id) {
+        this.noteUpdateDraft = null;
+        this.app.saveLocalStorage(NOTE_UPDATE_DRAFT, null);
+      }
+      this.status = '原笔记已更新，旧版本和讨论摘要已保存。';
+      return path;
+    } catch (error) {
+      if (content && !draft.savedNote) {
+        try {
+          const actual = await this.store.readConceptNote(draft.target);
+          if (actual.content === content) {
+            draft.savedNote = { path: actual.path, content };
+            this.app.saveLocalStorage(NOTE_UPDATE_DRAFT, draft);
+          }
+        } catch { /* The original failure remains visible; no recovery writes touch the note. */ }
+      }
+      this.status = this.safeError(error);
       throw new Error(this.status);
     } finally { this.state = 'idle'; this.emit(); }
   }
@@ -1482,7 +1678,19 @@ class ContextSourceModal extends Modal {
 }
 
 class ConceptModal extends Modal {
-  private draft: ConceptDraft | null = null;
+  private draft?: ConceptDraft;
+  private updateDraft?: NoteUpdateDraft;
+  private mode: 'new' | 'update' = 'new';
+  private candidates: NoteCandidate[] = [];
+  private newButton!: HTMLButtonElement;
+  private updateButton!: HTMLButtonElement;
+  private targetRow!: HTMLElement;
+  private targetSelect!: HTMLSelectElement;
+  private focusRow!: HTMLElement;
+  private changes!: HTMLElement;
+  private hint!: HTMLElement;
+  private discardUpdateButton!: HTMLButtonElement;
+  private modeChosen = false;
   private focusInput!: HTMLInputElement;
   private titleInput!: HTMLInputElement;
   private bodyInput!: HTMLTextAreaElement;
@@ -1505,16 +1713,35 @@ class ConceptModal extends Modal {
     const root = this.contentEl;
     root.empty();
     root.createEl('h2', { text: '整理成概念笔记' });
-    root.createEl('p', { text: '根据当前讨论生成笔记，可修改标题和内容后保存。整理会调用一次 DeepSeek，并使用少量相关笔记片段。' });
-    const focusRow = root.createDiv({ cls: 'cr-organize-focus' });
-    this.focusInput = focusRow.createEl('input', {
+    root.createEl('p', { text: '可保存新笔记，也可把后续讨论融入已有笔记。整理会调用 DeepSeek；更新时发送所选笔记当前正文与新增讨论。请检查预览后保存。' });
+    const modes = root.createDiv({ cls: 'cr-organize-modes' });
+    this.updateButton = modes.createEl('button', { text: '更新已有笔记' });
+    this.newButton = modes.createEl('button', { text: '保存为新笔记' });
+    this.updateButton.disabled = true;
+    this.updateButton.addEventListener('click', () => this.chooseMode('update'));
+    this.newButton.addEventListener('click', () => this.chooseMode('new'));
+    this.targetRow = root.createDiv({ cls: 'cr-organize-target' });
+    this.targetRow.createSpan({ text: '要更新的笔记' });
+    this.targetSelect = this.targetRow.createEl('select', { attr: { 'aria-label': '要更新的笔记' } });
+    this.targetSelect.addEventListener('change', () => {
+      this.modeChosen = true;
+      this.updateDraft = undefined;
+      this.editor.hide();
+      this.refreshMode();
+      this.statusEl.setText('点击“整理修订”，查看新增讨论如何融入这篇笔记。');
+    });
+    this.targetRow.hide();
+    this.focusRow = root.createDiv({ cls: 'cr-organize-focus' });
+    this.focusInput = this.focusRow.createEl('input', {
       attr: { type: 'text', placeholder: '要整理的概念（可选，留空则自动识别）', 'aria-label': '整理主题' },
     });
-    this.generateButton = focusRow.createEl('button', { text: '开始整理', cls: 'mod-cta' });
+    this.generateButton = root.createEl('button', { text: '开始整理', cls: 'mod-cta' });
     this.generateButton.addEventListener('click', () => { void this.generate(); });
     this.statusEl = root.createDiv({ cls: 'cr-organize-status' });
     this.statusEl.setAttr('aria-live', 'polite');
     this.editor = root.createDiv({ cls: 'cr-organize-editor' });
+    this.changes = this.editor.createDiv({ cls: 'cr-organize-changes' });
+    this.changes.hide();
     this.editor.createEl('label', { text: '笔记标题' });
     this.titleInput = this.editor.createEl('input', { attr: { type: 'text', 'aria-label': '笔记标题' } });
     const tabs = this.editor.createDiv({ cls: 'cr-organize-tabs' });
@@ -1528,6 +1755,12 @@ class ConceptModal extends Modal {
     });
     editButton.addEventListener('click', () => { this.preview.hide(); this.bodyInput.show(); });
     const persist = () => {
+      if (this.mode === 'update' && this.updateDraft && !this.updateDraft.savedNote) {
+        this.updateDraft.editedBody = this.bodyInput.value;
+        this.plugin.noteUpdateDraft = this.updateDraft;
+        this.app.saveLocalStorage(NOTE_UPDATE_DRAFT, this.updateDraft);
+        return;
+      }
       if (!this.draft || this.draft.savedNote) return;
       this.draft.editedTitle = this.titleInput.value;
       this.draft.editedBody = this.bodyInput.value;
@@ -1536,11 +1769,22 @@ class ConceptModal extends Modal {
     };
     this.titleInput.addEventListener('input', persist);
     this.bodyInput.addEventListener('input', persist);
-    this.editor.createEl('p', {
+    this.hint = this.editor.createEl('p', {
       text: '保存到“概念漫游/概念”，同时保存会话摘要。同名文件会新建副本。关联和来源可以在编辑页修改。',
       cls: 'cr-organize-hint',
     });
     const actions = root.createDiv({ cls: 'cr-organize-actions' });
+    this.discardUpdateButton = actions.createEl('button', { text: '丢弃修订草稿', attr: { title: '只清除本机修订草稿，已保存笔记和旧版本保留。' } });
+    this.discardUpdateButton.toggleVisibility(!!this.plugin.noteUpdateDraft);
+    this.discardUpdateButton.addEventListener('click', () => {
+      if (this.generating) return;
+      this.plugin.noteUpdateDraft = null;
+      this.app.saveLocalStorage(NOTE_UPDATE_DRAFT, null);
+      this.updateDraft = undefined;
+      if (this.mode === 'update') this.editor.hide();
+      this.refreshMode();
+      this.statusEl.setText('修订草稿已丢弃，已保存的笔记与旧版本保留。');
+    });
     const cancel = actions.createEl('button', { text: '取消' });
     cancel.addEventListener('click', () => this.close());
     this.saveButton = actions.createEl('button', { text: '保存到知识库', cls: 'mod-cta' });
@@ -1552,10 +1796,76 @@ class ConceptModal extends Modal {
       this.applyDraft(previous);
       this.statusEl.setText(previous.savedNote ? '笔记已保存，可以继续重试保存摘要。' : '已恢复上次整理草稿，可继续编辑或重新整理。');
     } else this.statusEl.setText('点击“开始整理”，生成可独立阅读的概念笔记。');
+    void this.loadTargets();
+  }
+
+  private async loadTargets(): Promise<void> {
+    try {
+      this.candidates = await this.plugin.noteCandidates();
+      if (this.closed) return;
+      this.targetSelect.empty();
+      for (const note of this.candidates) this.targetSelect.createEl('option', {
+        text: `${note.title} · ${note.path}${note.matchingBranch ? '' : `（${note.unavailableReason ?? '来自其他分支'}）`}`,
+        attr: { value: note.path, ...(note.matchingBranch ? {} : { disabled: '' }) },
+      });
+      const eligible = this.candidates.find(note => note.matchingBranch);
+      if (eligible) this.targetSelect.value = eligible.path;
+      const restored = this.plugin.noteUpdateDraft;
+      if (!this.modeChosen && !this.generating && restored && restored.input.sessionId === this.plugin.session?.id &&
+          this.candidates.some(note => note.noteId === restored.target.noteId && note.matchingBranch)) {
+        this.applyUpdateDraft(restored);
+        this.statusEl.setText(restored.savedNote ? '原笔记已更新，请继续完成保存。' : '已恢复上次修订草稿，请检查修改对照。');
+      } else if (!this.modeChosen && !this.generating && !this.draft && eligible) this.chooseMode('update');
+      this.refreshMode();
+    } catch (error) {
+      if (!this.closed) {
+        this.updateButton.disabled = true;
+        this.statusEl.setText(`${error instanceof Error ? error.message : '已有笔记暂时无法读取。'} 可以保存为新笔记。`);
+      }
+    }
+  }
+
+  private chooseMode(mode: 'new' | 'update'): void {
+    if (this.generating || this.draft?.savedNote || this.updateDraft?.savedNote) return;
+    this.modeChosen = true;
+    this.mode = mode;
+    this.draft = undefined;
+    this.updateDraft = undefined;
+    this.editor.hide();
+    const prior = this.plugin.conceptDraft;
+    const update = this.plugin.noteUpdateDraft;
+    if (mode === 'new' && prior && prior.input.sessionId === this.plugin.session?.id) this.applyDraft(prior);
+    else if (mode === 'update' && update && update.input.sessionId === this.plugin.session?.id && update.target.path === this.targetSelect.value) this.applyUpdateDraft(update);
+    else this.statusEl.setText(mode === 'update' ? '点击“整理修订”，检查新增讨论带来的修改。' : '点击“开始整理”，生成新的概念笔记。');
+    this.refreshMode();
+  }
+
+  private refreshMode(): void {
+    const saved = !!(this.draft?.savedNote || this.updateDraft?.savedNote);
+    this.newButton.setAttr('aria-pressed', String(this.mode === 'new'));
+    this.updateButton.setAttr('aria-pressed', String(this.mode === 'update'));
+    this.newButton.disabled = this.generating || saved;
+    this.updateButton.disabled = this.generating || saved || !this.candidates.some(note => note.matchingBranch);
+    this.targetRow.toggleVisibility(this.mode === 'update');
+    this.focusRow.toggleVisibility(this.mode === 'new');
+    this.targetSelect.disabled = this.generating || saved;
+    this.discardUpdateButton.toggleVisibility(!!this.plugin.noteUpdateDraft);
+    this.discardUpdateButton.disabled = this.generating;
+    this.focusInput.disabled = this.generating;
+    this.generateButton.setText(this.mode === 'update' ? (this.updateDraft ? '重新整理修订' : '整理修订') : this.draft ? '重新整理' : '开始整理');
+    this.generateButton.disabled = this.generating || saved ||
+      (this.mode === 'update' && !this.candidates.some(note => note.path === this.targetSelect.value && note.matchingBranch));
+    this.saveButton.disabled = this.generating || !(this.mode === 'update' ? this.updateDraft : this.draft);
+    this.titleInput.disabled = this.generating || this.mode === 'update' || saved;
+    this.bodyInput.disabled = this.generating || saved;
   }
 
   private applyDraft(draft: ConceptDraft): void {
+    this.mode = 'new';
     this.draft = draft;
+    this.updateDraft = undefined;
+    this.changes.hide();
+    this.hint.setText('保存新概念笔记及摘要。同名文件会新建副本。关联和来源可以在编辑页修改。');
     this.focusInput.value = draft.input.focus;
     this.titleInput.value = draft.editedTitle ?? draft.result.title;
     this.bodyInput.value = draft.editedBody ?? conceptBody(draft);
@@ -1567,15 +1877,44 @@ class ConceptModal extends Modal {
     this.generateButton.setText('重新整理');
     this.generateButton.disabled = !!draft.savedNote;
     void this.renderPreview();
+    this.refreshMode();
+  }
+
+  private applyUpdateDraft(draft: NoteUpdateDraft): void {
+    this.mode = 'update';
+    this.updateDraft = draft;
+    this.draft = undefined;
+    const selected = this.candidates.find(note => note.path === draft.target.path) ?? this.candidates.find(note => note.noteId === draft.target.noteId);
+    this.targetSelect.value = selected?.path ?? draft.target.path;
+    const compiled = compileNoteUpdate(draft.input, draft.result);
+    this.titleInput.value = draft.target.title;
+    this.bodyInput.value = draft.editedBody ?? compiled.body;
+    this.hint.setText('确认后更新原笔记，保留属性区并保存旧版本和讨论摘要。对照展示 AI 建议；最终写入内容以预览或编辑后的正文为准。');
+    this.changes.empty();
+    this.changes.createEl('h3', { text: '本次修改建议' });
+    if (!compiled.changes.length) this.changes.createEl('p', { text: '没有需要改动正文的内容，确认保存将记录讨论进度与摘要。' });
+    for (const [index, change] of compiled.changes.entries()) {
+      const card = this.changes.createEl('details', { cls: 'cr-note-change' });
+      card.open = index === 0;
+      card.createEl('summary', { text: `${index + 1}. ${change.append ? '新增' : change.after ? '修订' : '删除'}：${change.reason}` });
+      if (change.before) { card.createEl('strong', { text: '原文' }); card.createEl('pre', { text: change.before }); }
+      if (change.after) { card.createEl('strong', { text: '修订后' }); card.createEl('pre', { text: change.after }); }
+    }
+    this.changes.show();
+    this.editor.show();
+    this.saveButton.setText(draft.savedNote ? '继续完成保存' : '确认更新原笔记');
+    this.refreshMode();
+    void this.renderPreview();
   }
 
   private async renderPreview(): Promise<void> {
-    if (!this.draft) return;
+    if (!this.draft && !this.updateDraft) return;
     const version = ++this.renderVersion;
     const fragment = this.preview.doc.createElement('div');
     try {
       await MarkdownRenderer.render(this.app,
-        `# ${this.titleInput.value}\n\n${this.bodyInput.value}`, fragment, `${ROOT}/概念`, this.renderer);
+        this.mode === 'update' ? this.bodyInput.value : `# ${this.titleInput.value}\n\n${this.bodyInput.value}`,
+        fragment, this.updateDraft?.input.path ?? `${ROOT}/概念`, this.renderer);
       if (!this.closed && version === this.renderVersion) this.preview.replaceChildren(...Array.from(fragment.childNodes));
     } catch { if (!this.closed) this.preview.setText(this.bodyInput.value); }
   }
@@ -1583,6 +1922,7 @@ class ConceptModal extends Modal {
   private async generate(): Promise<void> {
     if (this.generating) return;
     this.generating = true;
+    this.refreshMode();
     this.generateButton.disabled = true;
     this.saveButton.disabled = true;
     this.focusInput.disabled = true;
@@ -1590,42 +1930,44 @@ class ConceptModal extends Modal {
     this.bodyInput.disabled = true;
     this.statusEl.setText('正在整理…');
     try {
-      const draft = await this.plugin.generateConcept(this.focusInput.value, characters => {
+      const progress = (characters: number) => {
         if (!this.closed) this.statusEl.setText(`正在整理，已接收 ${characters} 个字符…`);
-      });
-      if (!this.closed) {
-        this.applyDraft(draft);
-        this.statusEl.setText(`整理完成，找到 ${draft.result.related.length} 条关联。请检查内容后保存。`);
+      };
+      if (this.mode === 'update') {
+        const draft = await this.plugin.generateNoteUpdate(this.targetSelect.value, progress);
+        if (!this.closed) { this.applyUpdateDraft(draft); this.statusEl.setText(`已生成 ${draft.result.changes.length} 处修改建议，请检查对照和最终预览。`); }
+      } else {
+        const draft = await this.plugin.generateConcept(this.focusInput.value, progress);
+        if (!this.closed) { this.applyDraft(draft); this.statusEl.setText(`整理完成，找到 ${draft.result.related.length} 条关联。请检查内容后保存。`); }
       }
     } catch (error) {
       if (!this.closed) this.statusEl.setText(error instanceof Error ? error.message : '整理失败，请重试。');
     } finally {
       this.generating = false;
       if (!this.closed) {
-        this.generateButton.disabled = !!this.draft?.savedNote;
-        this.focusInput.disabled = false;
-        this.saveButton.disabled = !this.draft;
-        this.titleInput.disabled = !!this.draft?.savedNote;
-        this.bodyInput.disabled = !!this.draft?.savedNote;
+        this.refreshMode();
       }
     }
   }
 
   private async save(): Promise<void> {
-    if (!this.draft || this.generating) return;
+    if ((!this.draft && !this.updateDraft) || this.generating) return;
+    this.generating = true;
+    this.refreshMode();
     this.saveButton.disabled = true;
     this.generateButton.disabled = true;
     try {
-      const path = await this.plugin.saveConcept(this.draft, this.titleInput.value, this.bodyInput.value);
+      const path = this.mode === 'update' && this.updateDraft
+        ? await this.plugin.saveNoteUpdate(this.updateDraft, this.bodyInput.value)
+        : await this.plugin.saveConcept(this.draft!, this.titleInput.value, this.bodyInput.value);
       this.close();
-      new Notice('概念笔记和讨论摘要已保存。');
+      new Notice(this.mode === 'update' ? '原笔记已更新，旧版本和讨论摘要已保存。' : '概念笔记和讨论摘要已保存。');
       void this.app.workspace.openLinkText(path, '', true).catch(() => new Notice(`笔记已保存：${path}`));
     } catch (error) {
       this.statusEl.setText(error instanceof Error ? error.message : '保存失败，请重试。');
-      this.saveButton.disabled = false;
-      this.generateButton.disabled = false;
-      if (this.draft.savedNote) this.applyDraft(this.draft);
-    }
+      if (this.updateDraft?.savedNote) this.applyUpdateDraft(this.updateDraft);
+      else if (this.draft?.savedNote) this.applyDraft(this.draft);
+    } finally { this.generating = false; if (!this.closed) this.refreshMode(); }
   }
 
   onClose(): void {

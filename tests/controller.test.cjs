@@ -1606,3 +1606,69 @@ test('context compression: organizing a saved conversation uses raw messages and
   assert.equal(host.plugin.messages.length, original.length);
   host.plugin.onunload();
 });
+
+test('note update: discovering a target locks other-window sends and duplicate generation', async () => {
+  const host = await ready();
+  await host.plugin.send('讨论路径依赖');
+  let enter;
+  const entered = new Promise(resolve => { enter = resolve; });
+  let release;
+  host.plugin.store.noteCandidates = async () => {
+    enter();
+    await new Promise(resolve => { release = resolve; });
+    return [];
+  };
+  const before = savedMessageTexts(host);
+  const callCount = host.calls.length;
+  const pending = host.plugin.generateNoteUpdate('尚未找到.md');
+  await entered;
+  assert.equal(host.plugin.state, 'connecting');
+  assert.equal(await host.plugin.send('另一个窗口的问题'), false);
+  await assert.rejects(host.plugin.generateNoteUpdate('其他.md'), /等待/);
+  release();
+  await assert.rejects(pending, /未关联/);
+  assert.equal(host.plugin.state, 'idle');
+  assert.equal(host.calls.length, callCount);
+  assert.deepEqual(savedMessageTexts(host), before);
+  host.plugin.onunload();
+});
+
+test('note update: saving locks concurrent sends and rechecks synchronized source files before writing', async () => {
+  const host = await ready({ responder: options => {
+    const payload = JSON.parse(options.body);
+    if (payload.response_format && JSON.parse(payload.messages[1].content).currentBody !== undefined) {
+      return streamedText(JSON.stringify({ summary: '新增讨论未改变笔记正文。', changes: [], userStatements: [] }));
+    }
+    return organizationResponder(options);
+  } });
+  await host.plugin.send('什么是路径依赖？');
+  const original = await host.plugin.generateConcept('路径依赖');
+  const notePath = await host.plugin.saveConcept(original, original.result.title, host.conceptBody(original));
+  await host.plugin.send('继续讨论适用条件。');
+  const update = await host.plugin.generateNoteUpdate(notePath);
+  const before = host.records.get(notePath).text;
+  const originalMessages = host.plugin.store.messages.bind(host.plugin.store);
+  let enter, release;
+  const entered = new Promise(resolve => { enter = resolve; });
+  host.plugin.store.messages = async sessionId => {
+    enter();
+    await new Promise(resolve => { release = resolve; });
+    return originalMessages(sessionId);
+  };
+  const body = before.slice(before.indexOf('\n---\n') + 5).replace(/^\n+/, '');
+  const pending = host.plugin.saveNoteUpdate(update, body);
+  await entered;
+  assert.equal(host.plugin.state, 'saving');
+  assert.equal(await host.plugin.send('另一个窗口继续'), false);
+  await assert.rejects(host.plugin.saveNoteUpdate(update, body), /等待/);
+  const sourcePath = `概念漫游/会话/${update.input.sessionId}/消息/${update.input.messages[0].id}.json`;
+  const source = JSON.parse(host.records.get(sourcePath).text);
+  source.content += ' 同步带来的原文变化';
+  host.records.get(sourcePath).text = JSON.stringify(source);
+  release();
+  await assert.rejects(pending, /原始讨论已经变化/);
+  assert.equal(host.records.get(notePath).text, before);
+  assert.equal([...host.records.keys()].some(path => path.includes('/笔记版本/')), false);
+  assert.equal(host.plugin.state, 'idle');
+  host.plugin.onunload();
+});

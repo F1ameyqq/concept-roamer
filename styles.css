@@ -131,6 +131,16 @@
   .concept-roamer *, .concept-roamer *::before, .concept-roamer *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
 .cr-organize-modal { width: min(850px, 95vw); }
+.cr-organize-modal .cr-organize-modes { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.cr-organize-modal .cr-organize-modes button[aria-pressed="true"] { background: #f5bdce; color: #38252d; }
+.cr-organize-modal .cr-organize-target { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.cr-organize-modal .cr-organize-target select { max-width: 100%; width: 100%; }
+.cr-organize-modal .cr-organize-changes { max-height: 30vh; overflow: auto; overflow-wrap: anywhere; margin-bottom: 14px; }
+.cr-organize-modal .cr-note-change { border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 10px; margin: 8px 0; }
+.cr-organize-modal .cr-note-change summary { cursor: pointer; line-height: 1.5; }
+.cr-organize-modal .cr-note-change strong { display: block; margin-top: 10px; font-size: .85em; }
+.cr-organize-modal .cr-note-change pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; margin: 6px 0; border-radius: 6px; background: var(--background-secondary); font: inherit; font-size: .9em; line-height: 1.65; }
+.cr-organize-modal button:focus-visible, .cr-organize-modal select:focus-visible { outline: 2px solid #be5b7d; outline-offset: 2px; }
 .cr-organize-modal .cr-organize-focus { display: flex; gap: 8px; }
 .cr-organize-modal .cr-organize-focus input { flex: 1; min-width: 0; }
 .cr-organize-modal .cr-organize-status { color: var(--text-muted); font-size: .85em; margin: 14px 0; }
