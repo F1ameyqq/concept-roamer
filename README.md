@@ -16,6 +16,7 @@ Discuss concepts with DeepSeek in Obsidian and turn a conversation into an edita
 - Manual and automatic context compression, with inspectable summaries and retained original messages.
 - Discuss selected note excerpts from the context menu, with a source card and retained context for follow-up questions.
 - Desktop pop-out chat using Obsidian's window support.
+- Pale pink user bubbles, spacious AI reading cards, and collapsible note excerpts, with light and dark theme support and layouts for narrow panes.
 
 ## Requirements and external service
 
@@ -61,6 +62,8 @@ To discuss a note, select text in editing, live preview, or reading mode and cho
 
 Saved messages retain the excerpt separately from the typed question, including its source. Follow-up questions, conversation export, automatic naming, and concept organization can use it. Selecting an excerpt alone does not establish the user's authorship or agreement with it.
 
+Quoted excerpts appear before the question in sent messages. Excerpts longer than 240 characters start collapsed; select the card header to expand or collapse them. The source and remove buttons operate independently of folding. Code blocks and wide tables scroll within the reply card.
+
 Sources mentioned in the conversation are marked as unverified. Review model output before relying on it. Automated memory extraction and lossless archive compression are not included in this release.
 
 ## Compatibility and validation
@@ -70,6 +73,8 @@ Windows uses a desktop-only HTTPS transport; Android uses browser `fetch` and `R
 Version 0.2.4 fixes the desktop module-loading failure exposed by upgrading from 0.2.0. The build lowers guarded imports to CommonJS loading, so the renderer does not resolve Node modules as browser URLs. Runtime errors retain their details; browser connection failures are handled at the request boundary.
 
 The current build passes 129 local tests, including context compression, branch fingerprints, rebuild continuation, cancellation, original-history fallback, compiled desktop requests, note selection, fresh discussion isolation, excerpt persistence, input limits, and concurrent selection handling. Chrome checks using a simulated Obsidian host and model covered manual and automatic compression, original-message viewing, safe plain-text summary display, modal cancellation, reload, branch isolation, and disabled compression at desktop and narrow widths. Existing selection menus, source cards, automatic titles, concept editing and saving, reading behavior, and module routing also have simulated-host coverage. Real DeepSeek summary quality, Android WebView streaming, selection menus, and device synchronization still require actual-use validation. Desktop behavior has been tried by the project owner; this does not establish compatibility across other installations.
+
+Version 0.2.8 also has simulated-host UI checks in both light and dark themes at widths of 320, 390, 620, and 820 pixels. These covered user text contrast, rich Markdown overflow, excerpt folding and keyboard operation, composer layout, and preservation of reading position during streaming. Actual Obsidian themes and Android devices still need use on the target installation.
 
 ## Development
 

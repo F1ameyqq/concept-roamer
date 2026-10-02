@@ -1003,7 +1003,7 @@ class ChatView extends ItemView {
   private conversationHeading!: HTMLElement;
   private titleButton!: HTMLButtonElement;
   private contextInfo!: HTMLElement;
-  private quoteCard!: HTMLElement;
+  private quoteCard!: HTMLDetailsElement;
   private quoteSource!: HTMLButtonElement;
   private quotePreview!: HTMLElement;
   private renderedQuote: NoteQuote | null | undefined;
@@ -1114,21 +1114,26 @@ class ChatView extends ItemView {
     this.latestButton.hide();
     this.status = footer.createDiv({ cls: 'cr-status' });
     this.status.setAttr('aria-live', 'polite');
-    this.quoteCard = footer.createDiv({ cls: 'cr-note-quote cr-pending-quote', attr: { 'aria-label': '选中的笔记文字' } });
-    const quoteHeader = this.quoteCard.createDiv({ cls: 'cr-note-quote-header' });
+    const composer = footer.createDiv({ cls: 'cr-composer' });
+    this.quoteCard = composer.createEl('details', { cls: 'cr-note-quote cr-pending-quote', attr: { 'aria-label': '选中的笔记文字' } });
+    const quoteHeader = this.quoteCard.createEl('summary', { cls: 'cr-note-quote-header', attr: { title: '展开或收起引用' } });
     quoteHeader.createSpan({ text: '引用笔记', cls: 'cr-note-quote-label' });
     this.quoteSource = this.button(quoteHeader, '来源', async () => {
       if (this.plugin.selectedQuote) await this.plugin.openNote(this.plugin.selectedQuote.path);
     });
     this.quoteSource.addClass('cr-note-source');
-    this.button(quoteHeader, '移除', async () => this.plugin.clearSelectedQuote()).addClass('cr-note-remove');
+    this.preventQuoteToggle(this.quoteSource);
+    const removeQuote = this.button(quoteHeader, '移除', async () => this.plugin.clearSelectedQuote());
+    removeQuote.addClass('cr-note-remove');
+    removeQuote.setAttr('aria-label', '移除选中的笔记引用');
+    this.preventQuoteToggle(removeQuote);
     this.quotePreview = this.quoteCard.createDiv({ cls: 'cr-note-quote-body' });
     this.quoteCard.hide();
-    this.input = footer.createEl('textarea', {
+    this.input = composer.createEl('textarea', {
       cls: 'cr-input', attr: { placeholder: '你最近对什么感到好奇？', rows: '3', 'aria-label': '聊天输入' },
     });
     this.composerSession = this.plugin.session?.id ?? 'new';
-    const actions = footer.createDiv({ cls: 'cr-actions' });
+    const actions = composer.createDiv({ cls: 'cr-actions' });
     actions.createSpan({ text: 'Enter 发送 · Shift + Enter 换行', cls: 'cr-hint' });
     this.saveButton = this.button(actions, '重试保存', () => this.plugin.retrySave());
     this.stopButton = this.button(actions, '停止', async () => this.plugin.stop());
@@ -1163,6 +1168,11 @@ class ChatView extends ItemView {
       void action().catch(error => new Notice(error instanceof Error ? error.message : '操作失败。'));
     });
     return button;
+  }
+
+  private preventQuoteToggle(button: HTMLButtonElement): void {
+    // Source and remove actions inside a summary must not activate its disclosure.
+    this.registerDomEvent(button, 'click', event => { event.preventDefault(); event.stopPropagation(); });
   }
 
   private async submit(): Promise<void> {
@@ -1208,7 +1218,9 @@ class ChatView extends ItemView {
     if (quote) {
       this.quoteSource.setText(quote.title);
       this.quoteSource.setAttr('title', quote.path);
+      this.quoteSource.setAttr('aria-label', `打开来源笔记：${quote.title}`);
       this.quotePreview.setText(quote.text);
+      this.quoteCard.open = quote.text.length <= 240;
     }
     this.input?.setAttr('placeholder', quote ? '想怎样讨论这段文字？' : '你最近对什么感到好奇？');
   }
@@ -1270,20 +1282,21 @@ class ChatView extends ItemView {
         this.list.insertBefore(bubble, this.tailSpace);
         const component = new Component();
         this.addChild(component);
-        row = {
-          bubble, label: message.role === 'user' ? bubble.createDiv({ cls: 'cr-label' }) : undefined,
-          text: bubble.createDiv({ cls: 'cr-text' }), component,
-        };
+        const label = message.role === 'user' ? bubble.createDiv({ cls: 'cr-label' }) : undefined;
         if (message.role === 'user' && message.noteQuote) {
           const quote = message.noteQuote;
-          const card = bubble.createDiv({ cls: 'cr-note-quote' });
-          const header = card.createDiv({ cls: 'cr-note-quote-header' });
+          const card = bubble.createEl('details', { cls: 'cr-note-quote cr-saved-quote' });
+          card.open = quote.text.length <= 240;
+          const header = card.createEl('summary', { cls: 'cr-note-quote-header', attr: { title: '展开或收起引用' } });
           header.createSpan({ text: '引用笔记', cls: 'cr-note-quote-label' });
           const source = this.button(header, quote.title, () => this.plugin.openNote(quote.path));
           source.addClass('cr-note-source');
           source.setAttr('title', quote.path);
+          source.setAttr('aria-label', `打开来源笔记：${quote.title}`);
+          this.preventQuoteToggle(source);
           card.createDiv({ cls: 'cr-note-quote-body', text: quote.text });
         }
+        row = { bubble, label, text: bubble.createDiv({ cls: 'cr-text' }), component };
         this.rows.set(message.id, row);
       }
       row.label?.setText('我');
