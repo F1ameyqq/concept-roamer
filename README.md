@@ -13,6 +13,7 @@ Discuss concepts with DeepSeek in Obsidian and turn a conversation into an edita
 - Suggestions for links to existing notes, plus a conversation summary.
 - Separate export of the original conversation.
 - Automatic conversation titles that evolve with the discussion, plus manual naming.
+- Manual and automatic context compression, with inspectable summaries and retained original messages.
 - Discuss selected note excerpts from the context menu, with a source card and retained context for follow-up questions.
 - Desktop pop-out chat using Obsidian's window support.
 
@@ -28,9 +29,25 @@ The plugin does not include analytics, a developer-operated proxy, or an updater
 
 The API key is managed through Obsidian SecretStorage. Plugin settings store the secret's name. Conversation JSON, generated notes, personality, and memory live inside your vault under `概念漫游/`. Recovery drafts are stored locally through Obsidian's local storage API.
 
+## Context compression
+
+Select **上下文** in the chat toolbar to compress earlier discussion, inspect the summary, view covered original messages, or rebuild from originals. Chat displays, transcript export, and concept organization continue to use the complete original records. Summaries are lossy AI material; check the original messages when details matter.
+
+**使用压缩上下文** and **自动压缩长对话** are enabled by default. When effective history plus the current question exceeds approximately 32,000 characters, the plugin attempts compression before saving or sending that question. This is a character budget, not a token estimate; personality and manual memory are separate. It normally keeps the latest four complete turns verbatim, reducing that number for large recent turns while retaining the latest complete turn and unanswered questions. A first summary needs at least two older completed turns.
+
+Compression makes additional DeepSeek requests containing earlier discussion from the selected branch and any existing summary, without personality, manual memory, or the unsent question. A batch contains at most 40,000 JSON characters of new material, with at most four batches per operation and a two-minute timeout per batch. There is no automatic paid retry. Interrupted, invalid, or non-reducing results are not adopted. **停止压缩** cancels from the modal; **停止** also works in chat. Completed batch checkpoints may be retained for the next attempt.
+
+Summaries separate AI explanations, exact user quotations, unresolved questions, and disagreements. Exact user quotations are checked against typed user messages; note excerpts and assistant replies cannot be attributed as user quotations. Incremental compression retains previously extracted user quotations. This validation cannot guarantee the accuracy or completeness of the AI's narrative summary.
+
+Summary JSON is saved under `概念漫游/会话/<session ID>/上下文/`, with source message IDs and a SHA-256 content fingerprint. Only an unchanged, fully available prefix of the selected conversation branch can use a summary. Switching branches, incomplete synchronization, or changed source content prevents an unrelated summary from being applied.
+
+Rebuilding from originals starts a new summary lineage. Later sends, reloads, and incremental compression continue that lineage, even when an older summary covered more messages. Very large old conversations may need multiple operations; after four completed batches, select **压缩上下文** to continue from the new checkpoint. Previous summary files are retained.
+
+On automatic compression failure, the plugin explicitly falls back to complete original history only if it fits the 80,000-character history-plus-question budget. Otherwise the unsent question remains unaccepted and the plugin requests manual compression or a new conversation. It does not silently truncate history. Disabling automatic compression still permits manual compression and existing summaries; disabling compressed context restores complete history without deleting summaries. Both settings affect all conversations, starting with the next send. Archive files themselves are not compressed.
+
 ## Installation and use
 
-This plugin has not yet been published to the community directory. For manual installation, copy `main.js`, `manifest.json`, and `styles.css` from a GitHub release into `.obsidian/plugins/concept-roamer/` inside your vault, then enable **Concept Roamer** in Community plugins. The chat interface and commands use Chinese labels.
+For manual installation, copy `main.js`, `manifest.json`, and `styles.css` from a GitHub release into `.obsidian/plugins/concept-roamer/` inside your vault, then enable **Concept Roamer** in Community plugins. The chat interface and commands use Chinese labels.
 
 1. Set your DeepSeek key and a model available to your account in plugin settings.
 2. Open the chat with the ribbon icon or the **打开聊天** command.
@@ -44,7 +61,7 @@ To discuss a note, select text in editing, live preview, or reading mode and cho
 
 Saved messages retain the excerpt separately from the typed question, including its source. Follow-up questions, conversation export, automatic naming, and concept organization can use it. Selecting an excerpt alone does not establish the user's authorship or agreement with it.
 
-Sources mentioned in the conversation are marked as unverified. Review model output before relying on it. Automated memory extraction, long-conversation context compression, and lossless archive compression are not included in this release.
+Sources mentioned in the conversation are marked as unverified. Review model output before relying on it. Automated memory extraction and lossless archive compression are not included in this release.
 
 ## Compatibility and validation
 
@@ -52,7 +69,7 @@ Windows uses a desktop-only HTTPS transport; Android uses browser `fetch` and `R
 
 Version 0.2.4 fixes the desktop module-loading failure exposed by upgrading from 0.2.0. The build lowers guarded imports to CommonJS loading, so the renderer does not resolve Node modules as browser URLs. Runtime errors retain their details; browser connection failures are handled at the request boundary.
 
-The current build passes 93 local tests, including compiled desktop requests, module loading, note selection menus, fresh discussion isolation, explicit continuation, excerpt persistence, follow-up context, source links, input limits, and concurrent selection handling. Chrome checks using a simulated Obsidian host and model covered selection menus in editing and reading modes, separate window documents, preserved drafts, source cards, and sending at desktop and narrow widths. The emitted module loader also passed isolated Chrome checks for desktop and mobile routing. Its automatic title display, manual naming, preview, edit, save, and reading behavior were tested in Chrome using a simulated Obsidian host and model response. Android WebView streaming, selection menus, and device synchronization still require real-device validation before a public compatibility claim. Desktop behavior has been tried by the project owner; this does not establish compatibility across other installations.
+The current build passes 129 local tests, including context compression, branch fingerprints, rebuild continuation, cancellation, original-history fallback, compiled desktop requests, note selection, fresh discussion isolation, excerpt persistence, input limits, and concurrent selection handling. Chrome checks using a simulated Obsidian host and model covered manual and automatic compression, original-message viewing, safe plain-text summary display, modal cancellation, reload, branch isolation, and disabled compression at desktop and narrow widths. Existing selection menus, source cards, automatic titles, concept editing and saving, reading behavior, and module routing also have simulated-host coverage. Real DeepSeek summary quality, Android WebView streaming, selection menus, and device synchronization still require actual-use validation. Desktop behavior has been tried by the project owner; this does not establish compatibility across other installations.
 
 ## Development
 

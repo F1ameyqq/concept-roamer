@@ -59,3 +59,11 @@
 .cr-organize-modal .cr-organize-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
 .cr-title-input { width: 100%; margin-bottom: 12px; }
 .cr-title-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.concept-roamer .cr-context-info { color: var(--text-muted); font-size: .75em; overflow-wrap: anywhere; }
+.cr-context-modal { width: min(750px, 95vw); }
+.cr-context-hint, .cr-context-status { color: var(--text-muted); font-size: .85em; overflow-wrap: anywhere; }
+.cr-context-status { margin: 12px 0; }
+.cr-context-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.cr-context-preview { max-height: 42vh; overflow: auto; overflow-wrap: anywhere; line-height: 1.6; }
+.cr-context-text { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.cr-context-source { max-height: 45vh; overflow: auto; margin-top: 12px; }

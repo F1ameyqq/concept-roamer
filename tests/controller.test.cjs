@@ -34,6 +34,7 @@ class Empty {}
 
 function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-test-key', responder,
   indexVisible = true, layoutInitiallyReady = true, raceFolderPath, automaticTitles = false,
+  useCompressedContext = true, automaticCompression = true,
   platform = { isDesktop: false, isDesktopApp: false, isMobileApp: true }, transport = 'auto', httpsRequest } = {}) {
   const calls = [];
   const fetchCalls = [];
@@ -178,7 +179,7 @@ function fakeHost({ storage = new Map(), records = new Map(), apiKey = 'local-te
     },
   }, { filename: 'concept-roamer/main.js' });
   const plugin = new module.exports.default(app);
-  plugin.loadData = async () => ({ automaticTitles, transport });
+  plugin.loadData = async () => ({ automaticTitles, transport, useCompressedContext, automaticCompression });
   return {
     plugin, app, records, storage, calls, fetchCalls, moduleLoads, nativeRequests, createAttempts,
     leaves, leafOperations, reads, shownMenus, conceptBody: module.exports.__testConceptBody,
@@ -1210,4 +1211,398 @@ test('concept workflow: summary write failure can retry without creating a secon
   const path = await host.plugin.saveConcept(draft, '路径依赖', '## 定义\n\n早期选择影响后续。');
   assert.equal(path, draft.savedNote.path);
   assert.equal([...host.records.keys()].filter(path => path.startsWith('概念漫游/概念/') && path.endsWith('.md')).length, 1);
+});
+
+const compressionPayload = payload => payload.messages?.[0]?.content.startsWith('生成会话的上下文摘要');
+const compressionResult = overrides => ({
+  topic: '路径依赖', summary: '保留讨论方向的上下文测试摘要。',
+  userStatements: [], openQuestions: ['怎样降低切换成本？'], disagreements: [], ...overrides,
+});
+const compressionResponder = options => {
+  const payload = JSON.parse(options.body);
+  return streamedText(compressionPayload(payload) ? JSON.stringify(compressionResult()) : '新的完整回答');
+};
+
+async function seedCompressionHistory(host, { turns = 9, characters = 900, quote = selectedPassage } = {}) {
+  await host.plugin.newSession();
+  const messages = [];
+  let parentId = null;
+  for (let turn = 0; turn < turns; turn++) {
+    for (const role of ['user', 'assistant']) {
+      const marker = `${role === 'user' ? '原始用户问题' : '原始助手解释'}-${turn}-`;
+      const message = {
+        schemaVersion: 1, id: webcrypto.randomUUID(), sessionId: host.plugin.session.id,
+        parentId, role, content: marker + '材料'.repeat(Math.ceil(characters / 2)), status: 'complete',
+        createdAt: new Date(Date.UTC(2026, 9, 2, 0, turn, role === 'user' ? 0 : 1)).toISOString(),
+        ...(turn === 0 && role === 'user' && quote ? { noteQuote: quote } : {}),
+      };
+      await host.plugin.store.saveMessage(message);
+      messages.push(message);
+      parentId = message.id;
+    }
+  }
+  host.plugin.messages = messages;
+  host.plugin.activeLeaf = parentId;
+  host.plugin.saveActive();
+  return messages;
+}
+
+function savedMessageTexts(host) {
+  return [...host.records].filter(([name]) => name.includes('/消息/') && name.endsWith('.json'))
+    .map(([name, record]) => [name, record.text]);
+}
+
+async function appendCompressionTurns(host, turns = 5) {
+  const added = [];
+  let parentId = host.plugin.activeLeaf;
+  for (let turn = 0; turn < turns; turn++) {
+    for (const role of ['user', 'assistant']) {
+      const message = {
+        schemaVersion: 1, id: webcrypto.randomUUID(), sessionId: host.plugin.session.id,
+        parentId, role, content: `后续${role}-${turn}-` + '新增材料'.repeat(150), status: 'complete',
+        createdAt: new Date(Date.UTC(2026, 9, 2, 5, turn, role === 'user' ? 0 : 1)).toISOString(),
+      };
+      await host.plugin.store.saveMessage(message);
+      added.push(message); parentId = message.id;
+    }
+  }
+  host.plugin.messages.push(...added);
+  host.plugin.activeLeaf = parentId;
+  host.plugin.saveActive();
+  return added;
+}
+
+test('context compression: manual compression replaces request history while preserving every original record and transcript', async () => {
+  const host = await ready({ responder: compressionResponder });
+  const original = await seedCompressionHistory(host);
+  const diskBefore = savedMessageTexts(host);
+  const leafBefore = host.plugin.activeLeaf;
+  const summary = await host.plugin.compressContext();
+  assert.equal(host.plugin.contextSummary.id, summary.id);
+  assert.equal(summary.sessionId, host.plugin.session.id);
+  assert.equal(summary.coveredIds[0], original[0].id);
+  assert.equal(summary.throughId, summary.coveredIds.at(-1));
+  assert.deepEqual(savedMessageTexts(host), diskBefore, 'compression must never rewrite chat records');
+  assert.equal(host.plugin.activeLeaf, leafBefore);
+  assert.equal(host.plugin.messages.length, original.length);
+  assert.equal(host.plugin.state, 'idle');
+  assert.equal(host.calls.length, 1, 'manual compression adds no conversation message');
+  assert.equal(host.calls[0].thinking.type, 'disabled');
+  assert.equal(JSON.stringify(host.calls[0]).includes('用户明确保存的背景与偏好'), false);
+  assert.ok(host.records.has(`概念漫游/会话/${summary.sessionId}/上下文/${summary.id}.json`));
+  await host.plugin.send('根据这次讨论继续解释');
+  const wire = JSON.stringify(host.calls.at(-1).messages);
+  assert.match(wire, /上下文测试摘要/);
+  assert.doesNotMatch(wire, /原始用户问题-0-/);
+  assert.match(wire, /原始用户问题-8-/);
+  host.app.workspace.openLinkText = async () => undefined;
+  await host.plugin.exportTranscript();
+  const transcript = [...host.records].find(([name]) => name.startsWith('概念漫游/导出/') && name.endsWith('.md'))[1].text;
+  assert.match(transcript, /原始用户问题-0-/);
+  assert.match(transcript, /原始助手解释-0-/);
+  assert.match(transcript, /早期的选择会改变后续选择的成本/);
+  assert.doesNotMatch(transcript, /上下文测试摘要/);
+  host.plugin.onunload();
+});
+
+test('context compression: reloading selects the matching saved summary and disabling its use restores raw request context', async () => {
+  const host = await ready({ responder: compressionResponder });
+  await seedCompressionHistory(host);
+  const summary = await host.plugin.compressContext();
+  host.plugin.onunload();
+  const restored = await ready({ records: host.records, storage: host.storage, responder: compressionResponder });
+  assert.equal(restored.plugin.contextSummary.id, summary.id);
+  assert.equal(restored.plugin.messages.length, 18);
+  restored.plugin.settings.useCompressedContext = false;
+  await restored.plugin.send('查看原始上下文');
+  const wire = JSON.stringify(restored.calls[0].messages);
+  assert.match(wire, /原始用户问题-0-/);
+  assert.doesNotMatch(wire, /上下文测试摘要/);
+  assert.equal(restored.calls.length, 1);
+  assert.equal(restored.records.has(`概念漫游/会话/${summary.sessionId}/上下文/${summary.id}.json`), true);
+  restored.plugin.onunload();
+});
+
+test('context compression: another branch cannot adopt an unrelated summary; a shared covered prefix remains usable', async () => {
+  const host = await ready({ responder: compressionResponder });
+  const original = await seedCompressionHistory(host);
+  const session = host.plugin.session;
+  const summary = await host.plugin.compressContext();
+  const sibling = {
+    ...original[2], id: webcrypto.randomUUID(), parentId: original[1].id,
+    content: '分支 B 独立问题', createdAt: '2026-10-02T03:00:00.000Z',
+  };
+  await host.plugin.store.saveMessage(sibling);
+  await host.plugin.loadSession(session, sibling.id);
+  assert.equal(host.plugin.contextSummary, null);
+  await host.plugin.send('继续分支 B');
+  const wire = JSON.stringify(host.calls.at(-1).messages);
+  assert.match(wire, /分支 B 独立问题/);
+  assert.match(wire, /原始用户问题-0-/);
+  assert.doesNotMatch(wire, /上下文测试摘要/);
+  assert.doesNotMatch(wire, /原始用户问题-8-/);
+  const sharedSibling = {
+    ...sibling, id: webcrypto.randomUUID(), parentId: summary.throughId,
+    content: '从已覆盖的共同前缀分叉', createdAt: '2026-10-02T04:00:00.000Z',
+  };
+  await host.plugin.store.saveMessage(sharedSibling);
+  await host.plugin.loadSession(session, sharedSibling.id);
+  assert.equal(host.plugin.contextSummary.id, summary.id);
+  await host.plugin.send('继续共享前缀的分支');
+  assert.match(JSON.stringify(host.calls.at(-1).messages), /上下文测试摘要/);
+  assert.doesNotMatch(JSON.stringify(host.calls.at(-1).messages), /分支 B 独立问题/);
+  host.plugin.onunload();
+});
+
+test('context compression: changed synced source text invalidates an otherwise matching summary', async () => {
+  const host = await ready({ responder: compressionResponder });
+  const original = await seedCompressionHistory(host);
+  await host.plugin.compressContext();
+  const path = `概念漫游/会话/${host.plugin.session.id}/消息/${original[0].id}.json`;
+  const saved = JSON.parse(host.records.get(path).text);
+  saved.content = '同步后原文发生了变化，旧摘要不能再代表这段对话。';
+  host.records.get(path).text = JSON.stringify(saved, null, 2);
+  host.plugin.onunload();
+  const restored = await ready({ records: host.records, storage: host.storage, responder: compressionResponder });
+  assert.equal(restored.plugin.contextSummary, null);
+  assert.equal(restored.plugin.messages[0].content, saved.content);
+  assert.equal(restored.calls.length, 0);
+  restored.plugin.onunload();
+});
+
+test('context compression: quoting selected note text as the user opinion rejects the result without changing chat or selection', async () => {
+  let userId;
+  const host = await ready({ responder: options => {
+    const payload = JSON.parse(options.body);
+    return streamedText(compressionPayload(payload) ? JSON.stringify(compressionResult({
+      userStatements: [{ messageId: userId, quote: selectedPassage.text }],
+    })) : '正常回答');
+  } });
+  const original = await seedCompressionHistory(host);
+  userId = original[0].id;
+  await host.plugin.prepareNoteDiscussion(selectedPassage, true);
+  const diskBefore = savedMessageTexts(host);
+  const quoteBefore = host.plugin.selectedQuote;
+  const leafBefore = host.plugin.activeLeaf;
+  await assert.rejects(host.plugin.compressContext(), /用户|原话|引用/);
+  assert.deepEqual(savedMessageTexts(host), diskBefore);
+  assert.equal(host.plugin.activeLeaf, leafBefore);
+  assert.equal(host.plugin.selectedQuote, quoteBefore);
+  assert.equal(host.plugin.contextSummary, null);
+  assert.equal(host.plugin.state, 'idle');
+  assert.equal([...host.records.keys()].some(name => name.includes('/上下文/') && name.endsWith('.json')), false);
+  host.plugin.onunload();
+});
+
+test('context compression: automatic compression happens before accepting a new question and keeps its selected material distinct', async () => {
+  const host = await ready({ responder: compressionResponder });
+  const original = await seedCompressionHistory(host, { characters: 1900 });
+  const originalCount = original.length;
+  let recordedDuringCompression;
+  // Assert from the request boundary: the new user message must not exist while the summary is being generated.
+  const originalFetch = host.calls;
+  const create = host.app.vault.create;
+  host.app.vault.create = async (name, text) => {
+    if (name.includes('/上下文/') && name.endsWith('.json')) recordedDuringCompression = host.plugin.messages.length;
+    return create(name, text);
+  };
+  await host.plugin.prepareNoteDiscussion(selectedPassage, true);
+  assert.equal(await host.plugin.send('新的带引用问题', host.plugin.selectedQuote), true);
+  assert.ok(originalFetch.some(compressionPayload));
+  assert.equal(recordedDuringCompression, originalCount);
+  assert.equal(host.plugin.messages.length, originalCount + 2);
+  assert.equal(host.plugin.messages.at(-2).content, '新的带引用问题');
+  assert.deepEqual(plain(host.plugin.messages.at(-2).noteQuote), selectedPassage);
+  assert.equal(host.plugin.selectedQuote, null);
+  const chat = originalFetch.filter(payload => !compressionPayload(payload));
+  assert.equal(chat.length, 1);
+  assert.match(JSON.stringify(chat[0].messages), /上下文测试摘要/);
+  assert.match(chat[0].messages.at(-1).content, /新的带引用问题/);
+  assert.match(chat[0].messages.at(-1).content, /不能仅凭引用推断用户的观点或认同/);
+  host.plugin.onunload();
+});
+
+test('context compression: automatic failure falls back to full raw history only within the existing safety budget', async () => {
+  for (const failure of ['invalid', 'http', 'save']) {
+    const host = await ready({ responder: options => {
+      const payload = JSON.parse(options.body);
+      if (compressionPayload(payload)) {
+        if (failure === 'http') return new Response('unavailable', { status: 503 });
+        if (failure === 'invalid') return streamedText('无效摘要 JSON');
+      }
+      return compressionResponder(options);
+    } });
+    await seedCompressionHistory(host, { characters: 1900 });
+    const diskBefore = savedMessageTexts(host);
+    if (failure === 'save') {
+      const create = host.app.vault.create;
+      host.app.vault.create = async (name, text) => {
+        if (name.includes('/上下文/')) throw new Error('context storage unavailable');
+        return create(name, text);
+      };
+    }
+    assert.equal(await host.plugin.send(`失败后继续 ${failure}`), true);
+    const chat = host.calls.filter(payload => !compressionPayload(payload));
+    assert.equal(chat.length, 1);
+    assert.match(JSON.stringify(chat[0].messages), /原始用户问题-0-/);
+    assert.doesNotMatch(JSON.stringify(chat[0].messages), /上下文测试摘要/);
+    assert.deepEqual(savedMessageTexts(host).slice(0, diskBefore.length), diskBefore);
+    assert.equal(host.plugin.contextSummary, null);
+    assert.equal(host.plugin.hasPendingSave(), false);
+    assert.equal(host.plugin.state, 'idle');
+    host.plugin.onunload();
+  }
+});
+
+test('context compression: failed automatic compression beyond the raw budget accepts no new question and keeps the quote', async () => {
+  const host = await ready({ responder: options => compressionPayload(JSON.parse(options.body))
+    ? streamedText('摘要格式错误') : streamedText('不应调用聊天') });
+  await seedCompressionHistory(host, { turns: 24, characters: 2100 });
+  await host.plugin.prepareNoteDiscussion(selectedPassage, true);
+  const messagesBefore = plain(host.plugin.messages);
+  const leafBefore = host.plugin.activeLeaf;
+  const diskBefore = savedMessageTexts(host);
+  const quoteBefore = host.plugin.selectedQuote;
+  await assert.rejects(host.plugin.send('不能在预算外偷偷忽略旧内容', quoteBefore), /上下文|压缩|摘要|预算/);
+  assert.equal(host.calls.filter(payload => !compressionPayload(payload)).length, 0);
+  assert.deepEqual(plain(host.plugin.messages), messagesBefore);
+  assert.deepEqual(savedMessageTexts(host), diskBefore);
+  assert.equal(host.plugin.activeLeaf, leafBefore);
+  assert.equal(host.plugin.selectedQuote, quoteBefore);
+  assert.equal(host.plugin.hasPendingSave(), false);
+  assert.equal(host.plugin.state, 'idle');
+  host.plugin.onunload();
+});
+
+test('context compression: stop during automatic compression cancels before question acceptance and leaves original history intact', async () => {
+  let entered;
+  const began = new Promise(resolve => { entered = resolve; });
+  const host = await ready({ responder: options => {
+    if (!compressionPayload(JSON.parse(options.body))) return streamedText('不应调用聊天');
+    entered();
+    return new Promise((_resolve, reject) => {
+      const abort = () => reject(Object.assign(new Error('compression stopped'), { name: 'AbortError' }));
+      if (options.signal.aborted) abort();
+      else options.signal.addEventListener('abort', abort, { once: true });
+    });
+  } });
+  await seedCompressionHistory(host, { characters: 1900 });
+  await host.plugin.prepareNoteDiscussion(selectedPassage, true);
+  const diskBefore = savedMessageTexts(host);
+  const countBefore = host.plugin.messages.length;
+  const leafBefore = host.plugin.activeLeaf;
+  const quoteBefore = host.plugin.selectedQuote;
+  const sending = host.plugin.send('压缩中停止的新问题', quoteBefore);
+  await began;
+  assert.equal(host.plugin.state, 'compressing');
+  assert.equal(host.plugin.hasPendingSave(), false);
+  assert.equal(await host.plugin.send('压缩中不能插入另一个问题'), false);
+  await assert.rejects(host.plugin.newSession(), /等待/);
+  await assert.rejects(host.plugin.prepareNoteDiscussion({ ...selectedPassage, text: '不能开启新会话' }), /等待/);
+  host.plugin.stop();
+  await assert.rejects(sending, /停止|取消|中止/);
+  assert.deepEqual(savedMessageTexts(host), diskBefore);
+  assert.equal(host.plugin.messages.length, countBefore);
+  assert.equal(host.plugin.activeLeaf, leafBefore);
+  assert.equal(host.plugin.selectedQuote, quoteBefore);
+  assert.equal(host.plugin.contextSummary, null);
+  assert.equal(host.plugin.state, 'idle');
+  assert.equal(host.calls.filter(payload => !compressionPayload(payload)).length, 0);
+  host.plugin.onunload();
+});
+
+test('context compression: a complete turn too large for a summary request falls back to bounded raw context', async () => {
+  const host = await ready({ responder: compressionResponder });
+  const original = await seedCompressionHistory(host, { turns: 3, characters: 50, quote: null });
+  original[0].content = '不可拆开的旧问题-' + '旧'.repeat(19000);
+  original[1].content = '不可拆开的旧解释-' + '解释'.repeat(12500);
+  for (const message of original.slice(0, 2)) {
+    const path = `概念漫游/会话/${message.sessionId}/消息/${message.id}.json`;
+    host.records.get(path).text = JSON.stringify(message, null, 2);
+  }
+  const before = savedMessageTexts(host);
+  assert.equal(await host.plugin.send('大轮次无法压缩时仍可使用完整上下文'), true);
+  assert.equal(host.calls.filter(compressionPayload).length, 0, 'the planner must not truncate a turn to fit');
+  assert.equal(host.calls.length, 1);
+  assert.match(JSON.stringify(host.calls[0].messages), /不可拆开的旧解释/);
+  assert.deepEqual(savedMessageTexts(host).slice(0, before.length), before);
+  host.plugin.onunload();
+});
+
+test('context compression: incremental summaries retain exact earlier user statements even if the model omits them', async () => {
+  let firstUser;
+  let summaries = 0;
+  const sources = [];
+  const host = await ready({ responder: options => {
+    const payload = JSON.parse(options.body);
+    if (!compressionPayload(payload)) return streamedText('正常回答');
+    sources.push(JSON.parse(payload.messages[1].content));
+    summaries++;
+    return streamedText(JSON.stringify(compressionResult({
+      summary: `第 ${summaries} 次上下文测试摘要`,
+      userStatements: summaries === 1 ? [{ messageId: firstUser.id, quote: '原始用户问题-0-' }] : [],
+    })));
+  } });
+  firstUser = (await seedCompressionHistory(host))[0];
+  const first = await host.plugin.compressContext();
+  const originalCovered = plain(first.coveredIds);
+  await appendCompressionTurns(host);
+  const second = await host.plugin.compressContext();
+  assert.equal(sources[1].previous.id, first.id);
+  assert.equal(sources[1].previous.result.userStatements[0].messageId, firstUser.id);
+  assert.equal(sources[1].messages.some(message => originalCovered.includes(message.messageId)), false,
+    'incremental compression supplies only the new source suffix after the earlier summary');
+  assert.ok(second.coveredIds.length > first.coveredIds.length);
+  assert.deepEqual(plain(second.coveredIds.slice(0, first.coveredIds.length)), originalCovered);
+  assert.deepEqual(plain(second.result.userStatements), [{ messageId: firstUser.id, quote: '原始用户问题-0-' }]);
+  const rebuilt = await host.plugin.compressContext(true);
+  assert.equal(sources.at(-1).previous, null);
+  assert.equal(sources.at(-1).messages[0].messageId, firstUser.id,
+    'rebuild starts from the real source rather than another summary');
+  assert.equal(rebuilt.coveredIds[0], firstUser.id);
+  assert.equal([...host.records.keys()].filter(name => name.includes('/上下文/') && name.endsWith('.json')).length, 3);
+  host.plugin.onunload();
+});
+
+test('context compression: large old history is processed in bounded batches and preserves recent original turns', async () => {
+  const host = await ready({ responder: compressionResponder });
+  const original = await seedCompressionHistory(host, { turns: 24, characters: 2100 });
+  const countBefore = original.length;
+  const before = savedMessageTexts(host);
+  assert.equal(await host.plugin.send('大历史分批压缩后继续'), true);
+  const summaries = host.calls.filter(compressionPayload);
+  assert.ok(summaries.length >= 2 && summaries.length <= 4);
+  for (const call of summaries) {
+    const source = JSON.parse(call.messages[1].content);
+    assert.ok(JSON.stringify(source.messages).length <= 40000);
+  }
+  const chat = host.calls.filter(payload => !compressionPayload(payload));
+  assert.equal(chat.length, 1);
+  const wire = JSON.stringify(chat[0].messages);
+  assert.match(wire, /上下文测试摘要/);
+  assert.match(wire, /原始用户问题-23-/);
+  assert.doesNotMatch(wire, /原始用户问题-0-/);
+  assert.ok(chat[0].messages.slice(1).reduce((size, message) => size + message.content.length, 0) <= 80000);
+  assert.equal(host.plugin.messages.length, countBefore + 2);
+  assert.deepEqual(savedMessageTexts(host).slice(0, before.length), before);
+  host.plugin.onunload();
+});
+
+test('context compression: organizing a saved conversation uses raw messages and note excerpts instead of compressed context', async () => {
+  let organizationInput;
+  const host = await ready({ responder: options => {
+    const payload = JSON.parse(options.body);
+    if (compressionPayload(payload)) return compressionResponder(options);
+    if (payload.response_format) organizationInput = JSON.parse(payload.messages[1].content);
+    return organizationResponder(options);
+  } });
+  const original = await seedCompressionHistory(host, { characters: 100 });
+  await host.plugin.compressContext();
+  await host.plugin.generateConcept('路径依赖');
+  assert.equal(organizationInput.messages.length, original.length);
+  assert.equal(organizationInput.messages[0].content, original[0].content);
+  assert.deepEqual(organizationInput.messages[0].noteQuote, selectedPassage);
+  assert.doesNotMatch(JSON.stringify(organizationInput), /上下文测试摘要/);
+  assert.equal(host.plugin.messages.length, original.length);
+  host.plugin.onunload();
 });

@@ -3,6 +3,7 @@ import { Message, Session, newId } from './model';
 import { safeNoteTitle } from './organize';
 import { TitleRevision, applyTitleRevisions, conversationTitle, provisionalTitle } from './titles';
 import { noteQuote } from './selection';
+import { ContextSummary, validateContextSummary } from './context';
 
 export const ROOT = '概念漫游';
 export const PERSONA = `${ROOT}/人格.md`;
@@ -106,6 +107,23 @@ export class VaultStore {
     }
     await this.writeSnapshot(path, content);
     return path;
+  }
+  async contextSummaries(sessionId: string): Promise<ContextSummary[]> {
+    const folder = `${ROOT}/会话/${sessionId}/上下文`;
+    if (await this.kind(folder) !== 'folder') return [];
+    const summaries: ContextSummary[] = [];
+    for (const path of (await this.app.vault.adapter.list(folder)).files) {
+      if (!path.endsWith('.json')) continue;
+      try {
+        const summary = validateContextSummary(JSON.parse(await this.text(path)));
+        if (summary.sessionId === sessionId && path === `${folder}/${summary.id}.json`) summaries.push(summary);
+      } catch { /* Ignore incomplete or invalid synced summaries; original messages remain authoritative. */ }
+    }
+    return summaries;
+  }
+  async saveContextSummary(summary: ContextSummary): Promise<void> {
+    const valid = validateContextSummary(summary);
+    await this.writeSnapshot(`${ROOT}/会话/${valid.sessionId}/上下文/${valid.id}.json`, JSON.stringify(valid, null, 2));
   }
   async writeSnapshot(path: string, content: string): Promise<void> {
     await this.folder(path.slice(0, path.lastIndexOf('/')));
